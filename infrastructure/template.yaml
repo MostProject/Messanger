@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Messanger - Serverless messaging server with Claude Code worker
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: Anthropic API key for Claude Code
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+    Description: Google Gemini API key
+  NewsApiKey:
+    Type: String
+    NoEcho: true
+    Description: NewsAPI.org API key
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - arm64
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        CONNECTIONS_TABLE: !Ref ConnectionsTable
+        CONVERSATIONS_TABLE: !Ref ConversationsTable
+        ANNOUNCEMENTS_TABLE: !Ref AnnouncementsTable
+        REPORT_JOBS_TABLE: !Ref ReportJobsTable
+        NEWS_TRACKING_TABLE: !Ref NewsTrackingTable
+        IMAGES_BUCKET: !Ref ImagesBucket
+        REPORTS_BUCKET: !Ref ReportsBucket
+        REPORT_QUEUE_URL: !Ref ReportQueue
+
+Resources:
+  # API Gateway WebSocket API
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub messanger-websocket-${Environment}
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.MessageType
+
+  # WebSocket Stages
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+
+  # Connect Route
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${ConnectIntegration}
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectFunction.Arn}/invocations
+
+  ConnectFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub messanger-connect-${Environment}
+      CodeUri: ../cmd/lambda/connect/
+      Handler: bootstrap
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+
+  ConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/$connect
+
+  # Disconnect Route
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${DisconnectIntegration}
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectFunction.Arn}/invocations
+
+  DisconnectFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub messanger-disconnect-${Environment}
+      CodeUri: ../cmd/lambda/disconnect/
+      Handler: bootstrap
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+
+  DisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/$disconnect
+
+  # Default Route (handles all messages)
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub integrations/${DefaultIntegration}
+
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageFunction.Arn}/invocations
+
+  MessageFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub messanger-message-${Environment}
+      CodeUri: ../cmd/lambda/message/
+      Handler: bootstrap
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AnnouncementsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReportJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NewsTrackingTable
+        - S3CrudPolicy:
+            BucketName: !Ref ImagesBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReportQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  MessagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MessageFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/$default
+
+  # DynamoDB Tables
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub messanger-connections-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ConnectionId
+          AttributeType: S
+        - AttributeName: UserId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: ConnectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserId-index
+          KeySchema:
+            - AttributeName: UserId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub messanger-conversations-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ConversationId
+          AttributeType: S
+        - AttributeName: MessageId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: ConversationId
+          KeyType: HASH
+        - AttributeName: MessageId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  AnnouncementsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub messanger-announcements-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: N
+        - AttributeName: AnnouncementId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: AnnouncementId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  ReportJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub messanger-report-jobs-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: JobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: JobId
+          KeyType: HASH
+
+  NewsTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub messanger-news-tracking-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: LinkHash
+          AttributeType: S
+        - AttributeName: UserId
+          AttributeType: N
+      KeySchema:
+        - AttributeName: LinkHash
+          KeyType: HASH
+        - AttributeName: UserId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  # S3 Buckets
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub messanger-images-${Environment}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldImages
+            Status: Enabled
+            ExpirationInDays: 30
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub messanger-reports-${Environment}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # SQS Queue for Report Jobs
+  ReportQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub messanger-report-jobs-${Environment}
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReportDLQ.Arn
+        maxReceiveCount: 3
+
+  ReportDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub messanger-report-jobs-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+
+  # Secrets Manager for API Keys
+  ApiSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub messanger-api-keys-${Environment}
+      SecretString: !Sub |
+        {
+          "ANTHROPIC_API_KEY": "${AnthropicApiKey}",
+          "GEMINI_API_KEY": "${GeminiApiKey}",
+          "NEWS_API_KEY": "${NewsApiKey}"
+        }
+
+  # ECS Cluster for Worker
+  WorkerCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub messanger-worker-cluster-${Environment}
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # Worker Task Definition
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub messanger-worker-${Environment}
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt WorkerExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/messanger-worker:latest
+          Essential: true
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: REPORT_QUEUE_URL
+              Value: !Ref ReportQueue
+            - Name: WEBSOCKET_API_ENDPOINT
+              Value: !Sub https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+            - Name: CONNECTIONS_TABLE
+              Value: !Ref ConnectionsTable
+            - Name: REPORT_JOBS_TABLE
+              Value: !Ref ReportJobsTable
+            - Name: REPORTS_BUCKET
+              Value: !Ref ReportsBucket
+          Secrets:
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub ${ApiSecrets}:ANTHROPIC_API_KEY::
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/messanger-worker-${Environment}
+      RetentionInDays: 14
+
+  WorkerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref ApiSecrets
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WorkerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ConnectionsTable.Arn
+                  - !Sub ${ConnectionsTable.Arn}/index/*
+                  - !GetAtt ReportJobsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt ReportQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub ${ReportsBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  # Worker Service
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub messanger-worker-${Environment}
+      Cluster: !Ref WorkerCluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref WorkerSubnet
+          SecurityGroups:
+            - !Ref WorkerSecurityGroup
+
+  # VPC for Worker (minimal)
+  WorkerVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub messanger-worker-vpc-${Environment}
+
+  WorkerSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WorkerVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub messanger-worker-subnet-${Environment}
+
+  WorkerInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  WorkerVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref WorkerVPC
+      InternetGatewayId: !Ref WorkerInternetGateway
+
+  WorkerRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WorkerVPC
+
+  WorkerRoute:
+    Type: AWS::EC2::Route
+    DependsOn: WorkerVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref WorkerRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref WorkerInternetGateway
+
+  WorkerSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WorkerSubnet
+      RouteTableId: !Ref WorkerRouteTable
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for worker
+      VpcId: !Ref WorkerVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # ECR Repository for Worker Image
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: messanger-worker
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+Outputs:
+  WebSocketApiEndpoint:
+    Description: WebSocket API endpoint
+    Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-WebSocketEndpoint
+
+  ConnectionsTableName:
+    Description: DynamoDB Connections table name
+    Value: !Ref ConnectionsTable
+
+  ImagesBucketName:
+    Description: S3 Images bucket name
+    Value: !Ref ImagesBucket
+
+  ReportQueueUrl:
+    Description: SQS Report Queue URL
+    Value: !Ref ReportQueue
+
+  WorkerRepositoryUri:
+    Description: ECR Repository URI for worker
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${WorkerRepository}
