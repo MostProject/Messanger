@@ -11,9 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
-const (
-	ReportQueueURL = "https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/messanger-report-jobs"
-)
+// DefaultReportQueueURL is a placeholder - must be overridden via environment variable
+const DefaultReportQueueURL = ""
 
 // SQSQueue handles SQS operations
 type SQSQueue struct {
@@ -22,18 +21,25 @@ type SQSQueue struct {
 }
 
 // NewSQSQueue creates a new SQS queue handler
+// queueURL must be provided - will panic if empty (fail fast)
 func NewSQSQueue(client *sqs.Client, queueURL string) *SQSQueue {
-	if queueURL == "" {
-		queueURL = ReportQueueURL
-	}
 	return &SQSQueue{
 		client:   client,
 		queueURL: queueURL,
 	}
 }
 
+// IsConfigured returns true if the queue URL is set
+func (q *SQSQueue) IsConfigured() bool {
+	return q.queueURL != ""
+}
+
 // EnqueueReportJob sends a report job to the queue
 func (q *SQSQueue) EnqueueReportJob(ctx context.Context, job *models.ReportJob) error {
+	if !q.IsConfigured() {
+		return fmt.Errorf("SQS queue URL not configured")
+	}
+
 	body, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("failed to marshal job: %w", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/MostProject/Messanger/internal/models"
@@ -151,8 +152,10 @@ func (h *MessageHandler) handleConversationRequest(ctx context.Context, connecti
 		return h.wsService.SendError(ctx, connectionID, "conversation_error", "Failed to retrieve conversation")
 	}
 
-	// Mark messages as seen
-	h.store.MarkMessagesSeen(ctx, req.MesajGonderenKullaniciID, req.MesajAliciKullaniciID)
+	// Mark messages as seen (best effort - don't fail if this fails)
+	if err := h.store.MarkMessagesSeen(ctx, req.MesajGonderenKullaniciID, req.MesajAliciKullaniciID); err != nil {
+		log.Printf("Warning: failed to mark messages as seen: %v", err)
+	}
 
 	return h.wsService.SendConversation(ctx, connectionID, messages, hasMore)
 }
@@ -192,10 +195,13 @@ func (h *MessageHandler) handleImageUpload(ctx context.Context, connectionID str
 	messageID, err := h.store.SaveMessage(ctx, msg)
 	if err != nil {
 		log.Printf("Failed to save image message: %v", err)
+		// Continue anyway - image is uploaded, just message tracking failed
 	}
 
-	// Notify recipient
-	h.wsService.SendMessage(ctx, msg, messageID)
+	// Notify recipient (best effort)
+	if err := h.wsService.SendMessage(ctx, msg, messageID); err != nil {
+		log.Printf("Warning: failed to notify recipient of image: %v", err)
+	}
 
 	// Send confirmation to sender
 	response := map[string]interface{}{
@@ -216,6 +222,12 @@ func (h *MessageHandler) handleImageDownload(ctx context.Context, connectionID s
 		return h.wsService.SendError(ctx, connectionID, "image_error", "Invalid request format")
 	}
 
+	// Validate image key to prevent path traversal attacks
+	if !isValidImageKey(req.ImageKey) {
+		log.Printf("Invalid image key attempted: %s", req.ImageKey)
+		return h.wsService.SendError(ctx, connectionID, "image_error", "Invalid image key")
+	}
+
 	url, err := h.s3Store.GetImagePresignedURL(ctx, req.ImageKey)
 	if err != nil {
 		return h.wsService.SendError(ctx, connectionID, "image_error", "Failed to generate download URL")
@@ -227,6 +239,27 @@ func (h *MessageHandler) handleImageDownload(ctx context.Context, connectionID s
 		"DownloadURL": url,
 	}
 	return h.wsService.SendToConnection(ctx, connectionID, response)
+}
+
+// isValidImageKey validates that an image key is safe (no path traversal)
+func isValidImageKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	// Check for path traversal attempts
+	if strings.Contains(key, "..") || strings.HasPrefix(key, "/") || strings.Contains(key, "\\") {
+		return false
+	}
+	// Key should match our expected format: YYYYMMDD/senderID_recipientID_uuid.jpg
+	// Must contain a forward slash but not start with one
+	if !strings.Contains(key, "/") {
+		return false
+	}
+	// Must end with .jpg (our only supported format)
+	if !strings.HasSuffix(strings.ToLower(key), ".jpg") {
+		return false
+	}
+	return true
 }
 
 // handleReportRequest queues a report generation job
@@ -366,8 +399,15 @@ func (h *MessageHandler) handleChatMessage(ctx context.Context, connectionID str
 			Status:       models.JobStatusPending,
 			CreatedAt:    time.Now().UTC(),
 		}
-		h.store.SaveReportJob(ctx, job)
-		h.queue.EnqueueReportJob(ctx, job)
+		if err := h.store.SaveReportJob(ctx, job); err != nil {
+			log.Printf("Failed to save AI job: %v", err)
+			// Continue - we'll try to queue anyway
+		}
+		if err := h.queue.EnqueueReportJob(ctx, job); err != nil {
+			log.Printf("Failed to queue AI job: %v", err)
+			// Notify user that AI processing failed
+			_ = h.wsService.SendError(ctx, connectionID, "ai_error", "Failed to queue AI request, please try again")
+		}
 	}
 
 	// Send confirmation to sender

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,15 +28,16 @@ const (
 	maxConcurrentJobs = 3
 	pollInterval      = 5 * time.Second
 	jobTimeout        = 5 * time.Minute
+	AIClientID        = 9999
 )
 
 type Worker struct {
-	store     *storage.DynamoDBStore
-	s3Store   *storage.S3Store
-	queue     *queue.SQSQueue
-	wsService *services.WebSocketService
+	store       *storage.DynamoDBStore
+	s3Store     *storage.S3Store
+	queue       *queue.SQSQueue
+	wsService   *services.WebSocketService
 	apiEndpoint string
-	semaphore chan struct{}
+	activeJobs  int32 // atomic counter for active jobs
 }
 
 func NewWorker() (*Worker, error) {
@@ -44,11 +46,26 @@ func NewWorker() (*Worker, error) {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
+	// Validate required environment variables
+	apiEndpoint := os.Getenv("WEBSOCKET_API_ENDPOINT")
+	if apiEndpoint == "" {
+		return nil, fmt.Errorf("WEBSOCKET_API_ENDPOINT environment variable is required")
+	}
+
+	queueURL := os.Getenv("REPORT_QUEUE_URL")
+	if queueURL == "" {
+		return nil, fmt.Errorf("REPORT_QUEUE_URL environment variable is required")
+	}
+
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable is required")
+	}
+
 	ddbClient := dynamodb.NewFromConfig(cfg)
 	s3Client := s3.NewFromConfig(cfg)
 	sqsClient := sqs.NewFromConfig(cfg)
 
-	apiEndpoint := os.Getenv("WEBSOCKET_API_ENDPOINT")
 	apiClient := apigatewaymanagementapi.NewFromConfig(cfg, func(o *apigatewaymanagementapi.Options) {
 		o.BaseEndpoint = &apiEndpoint
 	})
@@ -59,10 +76,10 @@ func NewWorker() (*Worker, error) {
 	return &Worker{
 		store:       store,
 		s3Store:     storage.NewS3Store(s3Client),
-		queue:       queue.NewSQSQueue(sqsClient, os.Getenv("REPORT_QUEUE_URL")),
+		queue:       queue.NewSQSQueue(sqsClient, queueURL),
 		wsService:   wsService,
 		apiEndpoint: apiEndpoint,
-		semaphore:   make(chan struct{}, maxConcurrentJobs),
+		activeJobs:  0,
 	}, nil
 }
 
@@ -77,11 +94,20 @@ func (w *Worker) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Shutdown signal received, draining jobs...")
-			// Wait for in-flight jobs to complete
-			for i := 0; i < maxConcurrentJobs; i++ {
-				w.semaphore <- struct{}{}
+			log.Println("Shutdown signal received, waiting for in-flight jobs...")
+			// Wait for active jobs to complete with timeout
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			for atomic.LoadInt32(&w.activeJobs) > 0 {
+				select {
+				case <-shutdownCtx.Done():
+					log.Printf("Shutdown timeout, %d jobs still active", atomic.LoadInt32(&w.activeJobs))
+					return nil
+				case <-time.After(500 * time.Millisecond):
+					// Check again
+				}
 			}
+			log.Println("All jobs completed")
 			return nil
 		case <-ticker.C:
 			w.pollAndProcess(ctx)
@@ -90,111 +116,134 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) pollAndProcess(ctx context.Context) {
-	// Check how many slots are available
-	availableSlots := maxConcurrentJobs - len(w.semaphore)
+	// Use atomic counter to check available slots (no race condition)
+	currentJobs := atomic.LoadInt32(&w.activeJobs)
+	availableSlots := int32(maxConcurrentJobs) - currentJobs
 	if availableSlots <= 0 {
 		return
 	}
 
-	jobs, receiptHandles, err := w.queue.ReceiveReportJobs(ctx, int32(availableSlots))
+	jobs, receiptHandles, err := w.queue.ReceiveReportJobs(ctx, availableSlots)
 	if err != nil {
 		log.Printf("Error receiving jobs: %v", err)
 		return
 	}
 
 	for i, job := range jobs {
-		receiptHandle := receiptHandles[i]
-
-		// Acquire semaphore
-		select {
-		case w.semaphore <- struct{}{}:
-			go func(j *models.ReportJob, rh string) {
-				defer func() { <-w.semaphore }()
-				w.processJob(ctx, j, rh)
-			}(job, receiptHandle)
-		default:
-			// No slots available, job will be reprocessed later
+		// Double-check we haven't exceeded limit (another goroutine might have started)
+		if atomic.LoadInt32(&w.activeJobs) >= int32(maxConcurrentJobs) {
+			log.Printf("Max concurrent jobs reached, deferring remaining %d jobs", len(jobs)-i)
 			return
 		}
+
+		receiptHandle := receiptHandles[i]
+
+		// Increment active jobs counter atomically
+		atomic.AddInt32(&w.activeJobs, 1)
+
+		go func(j *models.ReportJob, rh string) {
+			defer atomic.AddInt32(&w.activeJobs, -1)
+			w.processJob(ctx, j, rh)
+		}(job, receiptHandle)
 	}
 }
 
 func (w *Worker) processJob(ctx context.Context, job *models.ReportJob, receiptHandle string) {
+	startTime := time.Now().UTC()
 	log.Printf("Processing job %s for user %d", job.JobID, job.UserID)
 
 	// Update job status
-	now := time.Now().UTC()
 	job.Status = models.JobStatusProcessing
-	job.StartedAt = &now
-	w.store.SaveReportJob(ctx, job)
+	job.StartedAt = &startTime
+	if err := w.store.SaveReportJob(ctx, job); err != nil {
+		log.Printf("Warning: failed to save job status: %v", err)
+	}
 
-	// Send progress update
-	w.wsService.SendReportPlaceholder(ctx, job.UserID, job.RequestID, "Processing with Claude Code", 30, "Analyzing query")
+	// Send progress update (ignore errors - best effort)
+	_ = w.wsService.SendReportPlaceholder(ctx, job.UserID, job.RequestID, "Processing with Claude Code", 30, "Analyzing query")
 
 	// Execute Claude Code
 	result, err := w.executeClaude(ctx, job)
 	if err != nil {
 		log.Printf("Job %s failed: %v", job.JobID, err)
-		w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusFailed, "", err.Error())
+		if err := w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusFailed, "", err.Error()); err != nil {
+			log.Printf("Warning: failed to update job status: %v", err)
+		}
 
 		// Send error to user
 		report := &models.ReportMessage{
-			MesajGonderenKullaniciID: 9999,
+			MesajGonderenKullaniciID: AIClientID,
 			MesajAliciKullaniciID:    job.UserID,
+			MesajGonderilenTarih:     time.Now().Format("2006-01-02 15:04:05"),
 			RequestID:                job.RequestID,
 			IsSuccessful:             false,
 			ErrorMessage:             err.Error(),
+			ProcessingTimeMs:         time.Since(startTime).Milliseconds(),
 		}
-		w.wsService.SendReport(ctx, job.UserID, report)
+		_ = w.wsService.SendReport(ctx, job.UserID, report)
 
 		// Delete from queue
-		w.queue.DeleteMessage(ctx, receiptHandle)
+		if err := w.queue.DeleteMessage(ctx, receiptHandle); err != nil {
+			log.Printf("Warning: failed to delete message from queue: %v", err)
+		}
 		return
 	}
 
 	// Save result to S3
 	reportKey, err := w.s3Store.SaveReport(ctx, job.JobID, result)
 	if err != nil {
-		log.Printf("Failed to save report to S3: %v", err)
+		log.Printf("Warning: failed to save report to S3: %v", err)
+		// Continue anyway - we can still send the result
 	}
 
 	// Update job status
-	w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusCompleted, reportKey, "")
+	if err := w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusCompleted, reportKey, ""); err != nil {
+		log.Printf("Warning: failed to update job status: %v", err)
+	}
 
 	// Parse and send result to user
-	report := w.parseClaudeResult(result, job)
-	w.wsService.SendReport(ctx, job.UserID, report)
+	report := w.parseClaudeResult(result, job, startTime)
+	if err := w.wsService.SendReport(ctx, job.UserID, report); err != nil {
+		log.Printf("Warning: failed to send report to user: %v", err)
+	}
 
 	// Delete from queue
-	w.queue.DeleteMessage(ctx, receiptHandle)
+	if err := w.queue.DeleteMessage(ctx, receiptHandle); err != nil {
+		log.Printf("Warning: failed to delete message from queue: %v", err)
+	}
 
-	log.Printf("Job %s completed successfully", job.JobID)
+	log.Printf("Job %s completed successfully in %v", job.JobID, time.Since(startTime))
 }
 
 func (w *Worker) executeClaude(ctx context.Context, job *models.ReportJob) (string, error) {
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(ctx, jobTimeout)
+	execCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 	defer cancel()
 
 	// Build prompt for Claude Code
 	prompt := w.buildPrompt(job)
 
 	// Execute Claude Code CLI
-	// The -p flag is for prompt, --output-format json for structured output
-	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json")
+	cmd := exec.CommandContext(execCtx, "claude", "-p", prompt, "--output-format", "json")
 
-	// Set environment variables
-	cmd.Env = append(os.Environ(),
-		"ANTHROPIC_API_KEY="+os.Getenv("ANTHROPIC_API_KEY"),
-	)
+	// Set environment variables (inherit current environment)
+	cmd.Env = os.Environ()
 
 	// Capture output
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if execCtx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("claude code execution timed out after %v", jobTimeout)
 		}
-		return "", fmt.Errorf("claude code execution failed: %w\nOutput: %s", err, string(output))
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("worker shutdown requested")
+		}
+		// Truncate output for error message
+		outputStr := string(output)
+		if len(outputStr) > 500 {
+			outputStr = outputStr[:500] + "..."
+		}
+		return "", fmt.Errorf("claude code execution failed: %w\nOutput: %s", err, outputStr)
 	}
 
 	return string(output), nil
@@ -229,13 +278,13 @@ The webApplication should be a complete, self-contained HTML page that displays 
 	return sb.String()
 }
 
-func (w *Worker) parseClaudeResult(result string, job *models.ReportJob) *models.ReportMessage {
+func (w *Worker) parseClaudeResult(result string, job *models.ReportJob, startTime time.Time) *models.ReportMessage {
 	report := &models.ReportMessage{
-		MesajGonderenKullaniciID: 9999, // AI user ID
+		MesajGonderenKullaniciID: AIClientID,
 		MesajAliciKullaniciID:    job.UserID,
 		MesajGonderilenTarih:     time.Now().Format("2006-01-02 15:04:05"),
 		RequestID:                job.RequestID,
-		ProcessingTimeMs:         time.Since(*job.StartedAt).Milliseconds(),
+		ProcessingTimeMs:         time.Since(startTime).Milliseconds(),
 	}
 
 	// Try to parse as JSON
@@ -248,10 +297,15 @@ func (w *Worker) parseClaudeResult(result string, job *models.ReportJob) *models
 	}
 
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		// If not valid JSON, use raw result
+		// If not valid JSON, treat raw result as HTML (might be direct output)
+		log.Printf("Warning: could not parse Claude output as JSON: %v", err)
 		report.ReportQuery = job.Query
 		report.WebApplication = result
-		report.IsSuccessful = true
+		// Mark as successful only if we have meaningful content
+		report.IsSuccessful = len(result) > 100
+		if !report.IsSuccessful {
+			report.ErrorMessage = "Invalid response format from Claude"
+		}
 	} else {
 		report.ReportQuery = parsed.ReportQuery
 		report.RequiredTables = parsed.RequiredTables
@@ -277,8 +331,8 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigCh
-		log.Println("Received shutdown signal")
+		sig := <-sigCh
+		log.Printf("Received signal: %v", sig)
 		cancel()
 	}()
 
