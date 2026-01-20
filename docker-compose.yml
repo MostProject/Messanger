@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # LocalStack for AWS services emulation
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"     # LocalStack Gateway
+      - "4510-4559:4510-4559"  # External services port range
+    environment:
+      - SERVICES=dynamodb,sqs,s3
+      - DEBUG=1
+      - DATA_DIR=/var/lib/localstack/data
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - "./local/localstack:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Initialize LocalStack resources
+  localstack-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: /bin/sh
+    command: |
+      -c "
+        # Create DynamoDB tables
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table \
+          --table-name messanger-connections \
+          --attribute-definitions AttributeName=ConnectionId,AttributeType=S AttributeName=UserId,AttributeType=N \
+          --key-schema AttributeName=ConnectionId,KeyType=HASH \
+          --global-secondary-indexes '[{\"IndexName\":\"UserId-index\",\"KeySchema\":[{\"AttributeName\":\"UserId\",\"KeyType\":\"HASH\"}],\"Projection\":{\"ProjectionType\":\"ALL\"},\"ProvisionedThroughput\":{\"ReadCapacityUnits\":5,\"WriteCapacityUnits\":5}}]' \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 \
+          --stream-specification StreamEnabled=false || true
+
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table \
+          --table-name messanger-conversations \
+          --attribute-definitions AttributeName=ConversationId,AttributeType=S AttributeName=MessageId,AttributeType=N \
+          --key-schema AttributeName=ConversationId,KeyType=HASH AttributeName=MessageId,KeyType=RANGE \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 || true
+
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table \
+          --table-name messanger-announcements \
+          --attribute-definitions AttributeName=UserId,AttributeType=N AttributeName=AnnouncementId,AttributeType=S \
+          --key-schema AttributeName=UserId,KeyType=HASH AttributeName=AnnouncementId,KeyType=RANGE \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 || true
+
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table \
+          --table-name messanger-report-jobs \
+          --attribute-definitions AttributeName=JobId,AttributeType=S \
+          --key-schema AttributeName=JobId,KeyType=HASH \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 || true
+
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table \
+          --table-name messanger-news-tracking \
+          --attribute-definitions AttributeName=LinkHash,AttributeType=S AttributeName=UserId,AttributeType=N \
+          --key-schema AttributeName=LinkHash,KeyType=HASH AttributeName=UserId,KeyType=RANGE \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 || true
+
+        # Create SQS queue
+        aws --endpoint-url=http://localstack:4566 sqs create-queue \
+          --queue-name messanger-report-queue || true
+
+        # Create S3 buckets
+        aws --endpoint-url=http://localstack:4566 s3 mb s3://messanger-images || true
+        aws --endpoint-url=http://localstack:4566 s3 mb s3://messanger-reports || true
+
+        echo 'LocalStack resources initialized!'
+      "
+
+  # Worker service
+  worker:
+    build:
+      context: .
+      dockerfile: cmd/worker/Dockerfile
+    depends_on:
+      localstack-init:
+        condition: service_completed_successfully
+    environment:
+      - AWS_ENDPOINT=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - WEBSOCKET_API_ENDPOINT=http://localhost:3000
+      - REPORT_QUEUE_URL=http://localstack:4566/000000000000/messanger-report-queue
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-sk-ant-test}
+      - ENVIRONMENT=local
+      - LOG_LEVEL=debug
+    ports:
+      - "8080:8080"   # Health check endpoint
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # WebSocket mock server for local testing
+  websocket-mock:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./local/websocket-mock:/app
+    ports:
+      - "3000:3000"
+    command: sh -c "npm install ws && node server.js"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  localstack:

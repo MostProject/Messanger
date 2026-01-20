@@ -35,8 +35,11 @@ RUN addgroup -g 1000 worker && \
 
 USER worker
 
-# Health check
+# Expose health check port
+EXPOSE 8080
+
+# Health check using HTTP endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep worker || exit 1
+    CMD wget -q --spider http://localhost:8080/health/live || exit 1
 
 ENTRYPOINT ["/app/worker"]

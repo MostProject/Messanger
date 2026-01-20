@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/MostProject/Messanger/internal/models"
@@ -24,16 +25,24 @@ const (
 
 	DefaultTTLDays       = 30
 	ConnectionTTLMinutes = 60
+	MaxBatchSize         = 25 // DynamoDB batch write limit
 )
 
 // DynamoDBStore handles all DynamoDB operations
 type DynamoDBStore struct {
 	client *dynamodb.Client
+
+	// Write buffer for batch operations
+	writeBuffer   map[string][]types.WriteRequest
+	writeBufferMu sync.Mutex
 }
 
 // NewDynamoDBStore creates a new DynamoDB store
 func NewDynamoDBStore(client *dynamodb.Client) *DynamoDBStore {
-	return &DynamoDBStore{client: client}
+	return &DynamoDBStore{
+		client:      client,
+		writeBuffer: make(map[string][]types.WriteRequest),
+	}
 }
 
 // --- Connection Management ---
@@ -459,4 +468,235 @@ func (s *DynamoDBStore) MarkAnnouncementDelivered(ctx context.Context, userID in
 		},
 	})
 	return err
+}
+
+// --- Batch Operations ---
+
+// BatchWriteItems performs a batch write operation
+func (s *DynamoDBStore) BatchWriteItems(ctx context.Context, tableName string, items []map[string]types.AttributeValue) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	// Split into batches of MaxBatchSize
+	for i := 0; i < len(items); i += MaxBatchSize {
+		end := i + MaxBatchSize
+		if end > len(items) {
+			end = len(items)
+		}
+
+		batch := items[i:end]
+		writeRequests := make([]types.WriteRequest, len(batch))
+		for j, item := range batch {
+			writeRequests[j] = types.WriteRequest{
+				PutRequest: &types.PutRequest{
+					Item: item,
+				},
+			}
+		}
+
+		_, err := s.client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+			RequestItems: map[string][]types.WriteRequest{
+				tableName: writeRequests,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("batch write failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// BatchDeleteItems performs a batch delete operation
+func (s *DynamoDBStore) BatchDeleteItems(ctx context.Context, tableName string, keys []map[string]types.AttributeValue) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(keys); i += MaxBatchSize {
+		end := i + MaxBatchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+
+		batch := keys[i:end]
+		writeRequests := make([]types.WriteRequest, len(batch))
+		for j, key := range batch {
+			writeRequests[j] = types.WriteRequest{
+				DeleteRequest: &types.DeleteRequest{
+					Key: key,
+				},
+			}
+		}
+
+		_, err := s.client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+			RequestItems: map[string][]types.WriteRequest{
+				tableName: writeRequests,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("batch delete failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// MarkMessagesSeenBatch marks multiple messages as seen using batch operation
+func (s *DynamoDBStore) MarkMessagesSeenBatch(ctx context.Context, user1, user2 int) error {
+	convID := getConversationID(user1, user2)
+
+	// Query unseen messages
+	result, err := s.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(ConversationsTable),
+		KeyConditionExpression: aws.String("ConversationId = :cid"),
+		FilterExpression:       aws.String("RecipientId = :rid AND IsSeen = :seen"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":cid":  &types.AttributeValueMemberS{Value: convID},
+			":rid":  &types.AttributeValueMemberN{Value: strconv.Itoa(user1)},
+			":seen": &types.AttributeValueMemberBOOL{Value: false},
+		},
+		ProjectionExpression: aws.String("ConversationId, MessageId"),
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(result.Items) == 0 {
+		return nil
+	}
+
+	// Use TransactWriteItems for atomic updates (up to 100 items)
+	for i := 0; i < len(result.Items); i += 25 {
+		end := i + 25
+		if end > len(result.Items) {
+			end = len(result.Items)
+		}
+
+		transactItems := make([]types.TransactWriteItem, end-i)
+		for j, item := range result.Items[i:end] {
+			transactItems[j] = types.TransactWriteItem{
+				Update: &types.Update{
+					TableName: aws.String(ConversationsTable),
+					Key: map[string]types.AttributeValue{
+						"ConversationId": item["ConversationId"],
+						"MessageId":      item["MessageId"],
+					},
+					UpdateExpression: aws.String("SET IsSeen = :seen"),
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":seen": &types.AttributeValueMemberBOOL{Value: true},
+					},
+				},
+			}
+		}
+
+		_, err := s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: transactItems,
+		})
+		if err != nil {
+			return fmt.Errorf("transact write failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// BatchGetConnections gets multiple connections by user IDs
+func (s *DynamoDBStore) BatchGetConnections(ctx context.Context, userIDs []int) (map[int]*models.Connection, error) {
+	if len(userIDs) == 0 {
+		return make(map[int]*models.Connection), nil
+	}
+
+	result := make(map[int]*models.Connection)
+
+	// Query each user's connection (GSI doesn't support BatchGetItem)
+	// Use goroutines for parallel queries
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errChan := make(chan error, len(userIDs))
+
+	for _, userID := range userIDs {
+		wg.Add(1)
+		go func(uid int) {
+			defer wg.Done()
+
+			conn, err := s.GetConnectionByUserID(ctx, uid)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			if conn != nil {
+				mu.Lock()
+				result[uid] = conn
+				mu.Unlock()
+			}
+		}(userID)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// --- Health Check ---
+
+// HealthCheck performs a quick health check on DynamoDB
+func (s *DynamoDBStore) HealthCheck(ctx context.Context) error {
+	_, err := s.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(ConnectionsTable),
+	})
+	return err
+}
+
+// --- Statistics ---
+
+// GetConnectionCount returns the number of active connections
+func (s *DynamoDBStore) GetConnectionCount(ctx context.Context) (int, error) {
+	result, err := s.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName: aws.String(ConnectionsTable),
+		Select:    types.SelectCount,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(result.Count), nil
+}
+
+// GetReportJobStats returns statistics about report jobs
+func (s *DynamoDBStore) GetReportJobStats(ctx context.Context) (map[string]int, error) {
+	stats := map[string]int{
+		"pending":    0,
+		"processing": 0,
+		"completed":  0,
+		"failed":     0,
+	}
+
+	result, err := s.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:            aws.String(ReportJobsTable),
+		ProjectionExpression: aws.String("#s"),
+		ExpressionAttributeNames: map[string]string{
+			"#s": "Status",
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range result.Items {
+		if status, ok := item["Status"].(*types.AttributeValueMemberS); ok {
+			stats[status.Value]++
+		}
+	}
+
+	return stats, nil
 }

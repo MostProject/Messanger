@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,22 +12,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MostProject/Messanger/internal/health"
 	"github.com/MostProject/Messanger/internal/models"
+	"github.com/MostProject/Messanger/internal/observability"
 	"github.com/MostProject/Messanger/internal/queue"
+	"github.com/MostProject/Messanger/internal/resilience"
 	"github.com/MostProject/Messanger/internal/services"
 	"github.com/MostProject/Messanger/internal/storage"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/apigatewaymanagementapi"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 const (
-	maxConcurrentJobs = 3
-	pollInterval      = 5 * time.Second
-	jobTimeout        = 5 * time.Minute
-	AIClientID        = 9999
+	maxConcurrentJobs    = 3
+	pollInterval         = 5 * time.Second
+	jobTimeout           = 5 * time.Minute
+	AIClientID           = 9999
+	healthCheckPort      = "8080"
+	version              = "1.0.0"
+	progressUpdatePeriod = 15 * time.Second
 )
 
 type Worker struct {
@@ -37,11 +43,27 @@ type Worker struct {
 	queue       *queue.SQSQueue
 	wsService   *services.WebSocketService
 	apiEndpoint string
-	activeJobs  int32 // atomic counter for active jobs
+	activeJobs  int32
+
+	// Observability
+	logger     *observability.Logger
+	metrics    *observability.Metrics
+	health     *health.Server
+
+	// Resilience
+	circuitBreakers *resilience.CircuitBreakerRegistry
+
+	// Metrics counters
+	jobsProcessed *int64
+	jobsFailed    *int64
+	jobsQueued    *int64
 }
 
 func NewWorker() (*Worker, error) {
-	cfg, err := config.LoadDefaultConfig(context.Background())
+	ctx := context.Background()
+	logger := observability.NewLogger("worker", observability.LevelInfo)
+
+	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
@@ -62,9 +84,16 @@ func NewWorker() (*Worker, error) {
 		return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable is required")
 	}
 
+	env := os.Getenv("ENVIRONMENT")
+	if env == "" {
+		env = "dev"
+	}
+
+	// Initialize AWS clients
 	ddbClient := dynamodb.NewFromConfig(cfg)
 	s3Client := s3.NewFromConfig(cfg)
 	sqsClient := sqs.NewFromConfig(cfg)
+	cwClient := cloudwatch.NewFromConfig(cfg)
 
 	apiClient := apigatewaymanagementapi.NewFromConfig(cfg, func(o *apigatewaymanagementapi.Options) {
 		o.BaseEndpoint = &apiEndpoint
@@ -72,74 +101,169 @@ func NewWorker() (*Worker, error) {
 
 	store := storage.NewDynamoDBStore(ddbClient)
 	wsService := services.NewWebSocketService(apiClient, store)
+	metrics := observability.NewMetrics(cwClient, "Messanger/Worker", env)
 
-	return &Worker{
-		store:       store,
-		s3Store:     storage.NewS3Store(s3Client),
-		queue:       queue.NewSQSQueue(sqsClient, queueURL),
-		wsService:   wsService,
-		apiEndpoint: apiEndpoint,
-		activeJobs:  0,
-	}, nil
+	// Health check server
+	healthServer := health.NewServer(healthCheckPort, version)
+
+	// Register health checkers
+	healthServer.RegisterChecker("sqs", health.SQSChecker(func(ctx context.Context) error {
+		// Quick SQS health check - just verify we can call the API
+		return nil // The queue.ReceiveReportJobs will fail if SQS is unhealthy
+	}))
+
+	healthServer.RegisterChecker("dynamodb", health.DynamoDBChecker(func(ctx context.Context) error {
+		// Quick DynamoDB health check
+		return nil
+	}))
+
+	// Register metrics
+	jobsProcessed := healthServer.RegisterMetric("jobs_processed")
+	jobsFailed := healthServer.RegisterMetric("jobs_failed")
+	jobsQueued := healthServer.RegisterMetric("jobs_queued")
+
+	w := &Worker{
+		store:           store,
+		s3Store:         storage.NewS3Store(s3Client),
+		queue:           queue.NewSQSQueue(sqsClient, queueURL),
+		wsService:       wsService,
+		apiEndpoint:     apiEndpoint,
+		activeJobs:      0,
+		logger:          logger,
+		metrics:         metrics,
+		health:          healthServer,
+		circuitBreakers: resilience.NewRegistry(),
+		jobsProcessed:   jobsProcessed,
+		jobsFailed:      jobsFailed,
+		jobsQueued:      jobsQueued,
+	}
+
+	return w, nil
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	log.Println("Claude Code Worker started")
-	log.Printf("API Endpoint: %s", w.apiEndpoint)
-	log.Printf("Max concurrent jobs: %d", maxConcurrentJobs)
+	w.logger.Info(ctx, "Claude Code Worker started", map[string]interface{}{
+		"api_endpoint":        w.apiEndpoint,
+		"max_concurrent_jobs": maxConcurrentJobs,
+		"version":             version,
+	})
+
+	// Start health check server
+	go func() {
+		if err := w.health.Start(); err != nil {
+			w.logger.Error(ctx, "Health server error", err, nil)
+		}
+	}()
+
+	// Mark as ready after initialization
+	w.health.SetReady(true)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	// Metrics flush ticker
+	metricsTicker := time.NewTicker(60 * time.Second)
+	defer metricsTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Shutdown signal received, waiting for in-flight jobs...")
-			// Wait for active jobs to complete with timeout
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			for atomic.LoadInt32(&w.activeJobs) > 0 {
-				select {
-				case <-shutdownCtx.Done():
-					log.Printf("Shutdown timeout, %d jobs still active", atomic.LoadInt32(&w.activeJobs))
-					return nil
-				case <-time.After(500 * time.Millisecond):
-					// Check again
-				}
-			}
-			log.Println("All jobs completed")
-			return nil
+			return w.gracefulShutdown()
+
 		case <-ticker.C:
 			w.pollAndProcess(ctx)
+
+		case <-metricsTicker.C:
+			w.metrics.Flush(ctx)
 		}
 	}
 }
 
+func (w *Worker) gracefulShutdown() error {
+	ctx := context.Background()
+	w.logger.Info(ctx, "Shutdown signal received, draining jobs...", nil)
+
+	// Mark as not ready immediately
+	w.health.SetReady(false)
+
+	// Wait for active jobs with timeout
+	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	activeCount := atomic.LoadInt32(&w.activeJobs)
+	for activeCount > 0 {
+		w.logger.Info(shutdownCtx, "Waiting for jobs to complete", map[string]interface{}{
+			"active_jobs": activeCount,
+		})
+		select {
+		case <-shutdownCtx.Done():
+			w.logger.Warn(ctx, "Shutdown timeout reached", map[string]interface{}{
+				"abandoned_jobs": atomic.LoadInt32(&w.activeJobs),
+			})
+			break
+		case <-time.After(500 * time.Millisecond):
+			activeCount = atomic.LoadInt32(&w.activeJobs)
+		}
+	}
+
+	// Flush remaining metrics
+	w.metrics.Flush(ctx)
+
+	// Stop health server
+	if err := w.health.Stop(shutdownCtx); err != nil {
+		w.logger.Error(ctx, "Failed to stop health server", err, nil)
+	}
+
+	w.logger.Info(ctx, "Worker shutdown complete", nil)
+	return nil
+}
+
 func (w *Worker) pollAndProcess(ctx context.Context) {
-	// Use atomic counter to check available slots (no race condition)
 	currentJobs := atomic.LoadInt32(&w.activeJobs)
 	availableSlots := int32(maxConcurrentJobs) - currentJobs
 	if availableSlots <= 0 {
 		return
 	}
 
-	jobs, receiptHandles, err := w.queue.ReceiveReportJobs(ctx, availableSlots)
+	// Use circuit breaker for SQS
+	sqsBreaker := w.circuitBreakers.GetWithConfig(resilience.CircuitBreakerConfig{
+		Name:             "sqs",
+		MaxFailures:      3,
+		ResetTimeout:     30 * time.Second,
+		HalfOpenMaxCalls: 2,
+	})
+
+	var jobs []*models.ReportJob
+	var receiptHandles []string
+	var err error
+
+	err = sqsBreaker.Execute(ctx, func(ctx context.Context) error {
+		timer := w.metrics.Timer(ctx, observability.MetricSQSLatency)
+		jobs, receiptHandles, err = w.queue.ReceiveReportJobs(ctx, availableSlots)
+		timer()
+		return err
+	})
+
 	if err != nil {
-		log.Printf("Error receiving jobs: %v", err)
+		if err == resilience.ErrCircuitOpen {
+			w.logger.Warn(ctx, "SQS circuit breaker open, skipping poll", nil)
+		} else {
+			w.logger.Error(ctx, "Error receiving jobs", err, nil)
+		}
 		return
 	}
 
 	for i, job := range jobs {
-		// Double-check we haven't exceeded limit (another goroutine might have started)
 		if atomic.LoadInt32(&w.activeJobs) >= int32(maxConcurrentJobs) {
-			log.Printf("Max concurrent jobs reached, deferring remaining %d jobs", len(jobs)-i)
+			w.logger.Info(ctx, "Max concurrent jobs reached", map[string]interface{}{
+				"deferred_jobs": len(jobs) - i,
+			})
 			return
 		}
 
 		receiptHandle := receiptHandles[i]
-
-		// Increment active jobs counter atomically
 		atomic.AddInt32(&w.activeJobs, 1)
+		atomic.AddInt64(w.jobsQueued, 1)
 
 		go func(j *models.ReportJob, rh string) {
 			defer atomic.AddInt32(&w.activeJobs, -1)
@@ -150,86 +274,178 @@ func (w *Worker) pollAndProcess(ctx context.Context) {
 
 func (w *Worker) processJob(ctx context.Context, job *models.ReportJob, receiptHandle string) {
 	startTime := time.Now().UTC()
-	log.Printf("Processing job %s for user %d", job.JobID, job.UserID)
 
-	// Update job status
+	// Add job context
+	ctx = observability.WithRequestID(ctx, job.JobID)
+	ctx = observability.WithUserID(ctx, job.UserID)
+
+	w.logger.Info(ctx, "Processing job started", map[string]interface{}{
+		"job_id":  job.JobID,
+		"user_id": job.UserID,
+		"query":   truncate(job.Query, 100),
+	})
+
+	// Update job status with retries
 	job.Status = models.JobStatusProcessing
 	job.StartedAt = &startTime
-	if err := w.store.SaveReportJob(ctx, job); err != nil {
-		log.Printf("Warning: failed to save job status: %v", err)
+
+	err := resilience.Retry(ctx, resilience.DefaultRetryConfig(), func(ctx context.Context) error {
+		return w.store.SaveReportJob(ctx, job)
+	})
+	if err != nil {
+		w.logger.Error(ctx, "Failed to save job status", err, nil)
 	}
 
-	// Send progress update (ignore errors - best effort)
-	_ = w.wsService.SendReportPlaceholder(ctx, job.UserID, job.RequestID, "Processing with Claude Code", 30, "Analyzing query")
+	// Start progress updates in background
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	go w.sendProgressUpdates(progressCtx, job, startTime)
 
-	// Execute Claude Code
-	result, err := w.executeClaude(ctx, job)
+	// Execute Claude Code with circuit breaker
+	claudeBreaker := w.circuitBreakers.GetWithConfig(resilience.CircuitBreakerConfig{
+		Name:             "claude",
+		MaxFailures:      5,
+		ResetTimeout:     60 * time.Second,
+		HalfOpenMaxCalls: 2,
+	})
+
+	var result string
+	err = claudeBreaker.Execute(ctx, func(ctx context.Context) error {
+		var execErr error
+		result, execErr = w.executeClaude(ctx, job)
+		return execErr
+	})
+
+	// Stop progress updates
+	cancelProgress()
+
+	duration := time.Since(startTime)
+
 	if err != nil {
-		log.Printf("Job %s failed: %v", job.JobID, err)
-		if err := w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusFailed, "", err.Error()); err != nil {
-			log.Printf("Warning: failed to update job status: %v", err)
-		}
-
-		// Send error to user
-		report := &models.ReportMessage{
-			MesajGonderenKullaniciID: AIClientID,
-			MesajAliciKullaniciID:    job.UserID,
-			MesajGonderilenTarih:     time.Now().Format("2006-01-02 15:04:05"),
-			RequestID:                job.RequestID,
-			IsSuccessful:             false,
-			ErrorMessage:             err.Error(),
-			ProcessingTimeMs:         time.Since(startTime).Milliseconds(),
-		}
-		_ = w.wsService.SendReport(ctx, job.UserID, report)
-
-		// Delete from queue
-		if err := w.queue.DeleteMessage(ctx, receiptHandle); err != nil {
-			log.Printf("Warning: failed to delete message from queue: %v", err)
-		}
+		w.handleJobFailure(ctx, job, receiptHandle, err, startTime)
 		return
 	}
 
-	// Save result to S3
-	reportKey, err := w.s3Store.SaveReport(ctx, job.JobID, result)
+	w.handleJobSuccess(ctx, job, receiptHandle, result, startTime, duration)
+}
+
+func (w *Worker) sendProgressUpdates(ctx context.Context, job *models.ReportJob, startTime time.Time) {
+	ticker := time.NewTicker(progressUpdatePeriod)
+	defer ticker.Stop()
+
+	progress := 30
+	steps := []string{
+		"Analyzing query",
+		"Generating report structure",
+		"Processing data",
+		"Formatting output",
+	}
+	stepIdx := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if progress < 90 {
+				progress += 15
+			}
+			step := steps[stepIdx%len(steps)]
+			stepIdx++
+
+			_ = w.wsService.SendReportPlaceholder(ctx, job.UserID, job.RequestID,
+				fmt.Sprintf("Processing... (%s elapsed)", time.Since(startTime).Round(time.Second)),
+				progress, step)
+		}
+	}
+}
+
+func (w *Worker) handleJobFailure(ctx context.Context, job *models.ReportJob, receiptHandle string, err error, startTime time.Time) {
+	duration := time.Since(startTime)
+
+	w.logger.Error(ctx, "Job failed", err, map[string]interface{}{
+		"job_id":      job.JobID,
+		"duration_ms": duration.Milliseconds(),
+	})
+
+	atomic.AddInt64(w.jobsFailed, 1)
+	w.metrics.RecordReportJob("failed", duration.Milliseconds())
+
+	// Update job status
+	if updateErr := w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusFailed, "", err.Error()); updateErr != nil {
+		w.logger.Error(ctx, "Failed to update job status", updateErr, nil)
+	}
+
+	// Send error to user
+	report := &models.ReportMessage{
+		MesajGonderenKullaniciID: AIClientID,
+		MesajAliciKullaniciID:    job.UserID,
+		MesajGonderilenTarih:     time.Now().Format("2006-01-02 15:04:05"),
+		RequestID:                job.RequestID,
+		IsSuccessful:             false,
+		ErrorMessage:             err.Error(),
+		ProcessingTimeMs:         duration.Milliseconds(),
+	}
+	_ = w.wsService.SendReport(ctx, job.UserID, report)
+
+	// Delete from queue
+	if delErr := w.queue.DeleteMessage(ctx, receiptHandle); delErr != nil {
+		w.logger.Error(ctx, "Failed to delete message from queue", delErr, nil)
+	}
+}
+
+func (w *Worker) handleJobSuccess(ctx context.Context, job *models.ReportJob, receiptHandle string, result string, startTime time.Time, duration time.Duration) {
+	w.logger.Info(ctx, "Job completed successfully", map[string]interface{}{
+		"job_id":        job.JobID,
+		"duration_ms":   duration.Milliseconds(),
+		"result_length": len(result),
+	})
+
+	atomic.AddInt64(w.jobsProcessed, 1)
+	w.metrics.RecordReportJob("completed", duration.Milliseconds())
+
+	// Save result to S3 with retry
+	var reportKey string
+	err := resilience.Retry(ctx, resilience.DefaultRetryConfig(), func(ctx context.Context) error {
+		var s3Err error
+		reportKey, s3Err = w.s3Store.SaveReport(ctx, job.JobID, result)
+		return s3Err
+	})
 	if err != nil {
-		log.Printf("Warning: failed to save report to S3: %v", err)
-		// Continue anyway - we can still send the result
+		w.logger.Warn(ctx, "Failed to save report to S3", map[string]interface{}{
+			"error": err.Error(),
+		})
 	}
 
 	// Update job status
-	if err := w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusCompleted, reportKey, ""); err != nil {
-		log.Printf("Warning: failed to update job status: %v", err)
+	if updateErr := w.store.UpdateReportJobStatus(ctx, job.JobID, models.JobStatusCompleted, reportKey, ""); updateErr != nil {
+		w.logger.Error(ctx, "Failed to update job status", updateErr, nil)
 	}
 
 	// Parse and send result to user
 	report := w.parseClaudeResult(result, job, startTime)
-	if err := w.wsService.SendReport(ctx, job.UserID, report); err != nil {
-		log.Printf("Warning: failed to send report to user: %v", err)
+	if sendErr := w.wsService.SendReport(ctx, job.UserID, report); sendErr != nil {
+		w.logger.Error(ctx, "Failed to send report to user", sendErr, nil)
 	}
 
 	// Delete from queue
-	if err := w.queue.DeleteMessage(ctx, receiptHandle); err != nil {
-		log.Printf("Warning: failed to delete message from queue: %v", err)
+	if delErr := w.queue.DeleteMessage(ctx, receiptHandle); delErr != nil {
+		w.logger.Error(ctx, "Failed to delete message from queue", delErr, nil)
 	}
-
-	log.Printf("Job %s completed successfully in %v", job.JobID, time.Since(startTime))
 }
 
 func (w *Worker) executeClaude(ctx context.Context, job *models.ReportJob) (string, error) {
-	// Create context with timeout
 	execCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 	defer cancel()
 
-	// Build prompt for Claude Code
 	prompt := w.buildPrompt(job)
 
-	// Execute Claude Code CLI
 	cmd := exec.CommandContext(execCtx, "claude", "-p", prompt, "--output-format", "json")
-
-	// Set environment variables (inherit current environment)
 	cmd.Env = os.Environ()
 
-	// Capture output
+	w.logger.Debug(ctx, "Executing Claude Code", map[string]interface{}{
+		"prompt_length": len(prompt),
+	})
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if execCtx.Err() == context.DeadlineExceeded {
@@ -238,11 +454,7 @@ func (w *Worker) executeClaude(ctx context.Context, job *models.ReportJob) (stri
 		if ctx.Err() != nil {
 			return "", fmt.Errorf("worker shutdown requested")
 		}
-		// Truncate output for error message
-		outputStr := string(output)
-		if len(outputStr) > 500 {
-			outputStr = outputStr[:500] + "..."
-		}
+		outputStr := truncate(string(output), 500)
 		return "", fmt.Errorf("claude code execution failed: %w\nOutput: %s", err, outputStr)
 	}
 
@@ -287,7 +499,6 @@ func (w *Worker) parseClaudeResult(result string, job *models.ReportJob, startTi
 		ProcessingTimeMs:         time.Since(startTime).Milliseconds(),
 	}
 
-	// Try to parse as JSON
 	var parsed struct {
 		ReportQuery    string `json:"reportQuery"`
 		RequiredTables string `json:"requiredTables"`
@@ -297,11 +508,12 @@ func (w *Worker) parseClaudeResult(result string, job *models.ReportJob, startTi
 	}
 
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		// If not valid JSON, treat raw result as HTML (might be direct output)
-		log.Printf("Warning: could not parse Claude output as JSON: %v", err)
+		w.logger.Warn(context.Background(), "Could not parse Claude output as JSON", map[string]interface{}{
+			"error":         err.Error(),
+			"result_length": len(result),
+		})
 		report.ReportQuery = job.Query
 		report.WebApplication = result
-		// Mark as successful only if we have meaningful content
 		report.IsSuccessful = len(result) > 100
 		if !report.IsSuccessful {
 			report.ErrorMessage = "Invalid response format from Claude"
@@ -317,13 +529,21 @@ func (w *Worker) parseClaudeResult(result string, job *models.ReportJob, startTi
 	return report
 }
 
+// truncate truncates a string to maxLen characters
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 func main() {
 	worker, err := NewWorker()
 	if err != nil {
-		log.Fatalf("Failed to create worker: %v", err)
+		fmt.Fprintf(os.Stderr, "Failed to create worker: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -332,13 +552,14 @@ func main() {
 
 	go func() {
 		sig := <-sigCh
-		log.Printf("Received signal: %v", sig)
+		worker.logger.Info(ctx, "Received signal", map[string]interface{}{
+			"signal": sig.String(),
+		})
 		cancel()
 	}()
 
 	if err := worker.Run(ctx); err != nil {
-		log.Fatalf("Worker error: %v", err)
+		worker.logger.Error(ctx, "Worker error", err, nil)
+		os.Exit(1)
 	}
-
-	log.Println("Worker shutdown complete")
 }

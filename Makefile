@@ -60,10 +60,43 @@ clean:
 	rm -rf .aws-sam
 	go clean
 
-# Local development
+# Local development (no Docker required)
+local:
+	@echo "Starting local development server..."
+	go run ./cmd/local
+
+# Local development with SAM (requires Docker)
 dev:
-	@echo "Starting local development environment..."
+	@echo "Starting local development environment with SAM..."
 	sam local start-api --template-file infrastructure/template.yaml
+
+# Run local server with hot reload (requires air: go install github.com/cosmtrek/air@latest)
+local-watch:
+	@echo "Starting local development server with hot reload..."
+	air -c .air.toml
+
+# Run worker locally (requires AWS credentials or LocalStack)
+run-worker:
+	@echo "Starting worker locally..."
+	WEBSOCKET_API_ENDPOINT=http://localhost:1738 \
+	REPORT_QUEUE_URL=http://localhost:4566/000000000000/messanger-report-queue \
+	ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
+	ENVIRONMENT=local \
+	LOG_LEVEL=debug \
+	go run ./cmd/worker
+
+# Docker compose for full local stack
+docker-up:
+	docker-compose up -d
+	@echo "LocalStack starting... waiting for health"
+	@sleep 10
+	@echo "Services ready!"
+
+docker-down:
+	docker-compose down
+
+docker-logs:
+	docker-compose logs -f
 
 # Get outputs from deployed stack
 outputs:
@@ -73,3 +106,23 @@ outputs:
 deps:
 	go mod download
 	go mod tidy
+
+# Install development tools
+dev-tools:
+	go install github.com/cosmtrek/air@latest
+	@echo "Air installed for hot reload (run: make local-watch)"
+
+# Run all tests with coverage
+test-coverage:
+	go test -v -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report: coverage.html"
+
+# Lint code
+lint:
+	golangci-lint run ./...
+
+# Format code
+fmt:
+	go fmt ./...
+	goimports -w .
