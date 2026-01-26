@@ -22,6 +22,20 @@ Parameters:
     Type: String
     NoEcho: true
     Description: NewsAPI.org API key
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for ECS Fargate tasks
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for security group
+  AppName:
+    Type: String
+    Default: messanger
+    Description: Application name prefix for resources
+  HealthPort:
+    Type: Number
+    Default: 8080
+    Description: Port for health check endpoint
 
 Globals:
   Function:
@@ -47,7 +61,7 @@ Resources:
   WebSocketApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
-      Name: !Sub messanger-websocket-${Environment}
+      Name: !Sub ${AppName}-websocket-${Environment}
       ProtocolType: WEBSOCKET
       RouteSelectionExpression: $request.body.MessageType
 
@@ -77,11 +91,9 @@ Resources:
 
   ConnectFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: go1.x
     Properties:
-      FunctionName: !Sub messanger-connect-${Environment}
-      CodeUri: ../cmd/lambda/connect/
+      FunctionName: !Sub ${AppName}-connect-${Environment}
+      CodeUri: ../bin/connect/
       Handler: bootstrap
       Policies:
         - DynamoDBCrudPolicy:
@@ -113,11 +125,9 @@ Resources:
 
   DisconnectFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: go1.x
     Properties:
-      FunctionName: !Sub messanger-disconnect-${Environment}
-      CodeUri: ../cmd/lambda/disconnect/
+      FunctionName: !Sub ${AppName}-disconnect-${Environment}
+      CodeUri: ../bin/disconnect/
       Handler: bootstrap
       Policies:
         - DynamoDBCrudPolicy:
@@ -149,11 +159,9 @@ Resources:
 
   MessageFunction:
     Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: go1.x
     Properties:
-      FunctionName: !Sub messanger-message-${Environment}
-      CodeUri: ../cmd/lambda/message/
+      FunctionName: !Sub ${AppName}-message-${Environment}
+      CodeUri: ../bin/message/
       Handler: bootstrap
       Timeout: 60
       MemorySize: 512
@@ -190,7 +198,7 @@ Resources:
   ConnectionsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub messanger-connections-${Environment}
+      TableName: !Sub ${AppName}-connections-${Environment}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: ConnectionId
@@ -214,7 +222,7 @@ Resources:
   ConversationsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub messanger-conversations-${Environment}
+      TableName: !Sub ${AppName}-conversations-${Environment}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: ConversationId
@@ -233,7 +241,7 @@ Resources:
   AnnouncementsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub messanger-announcements-${Environment}
+      TableName: !Sub ${AppName}-announcements-${Environment}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: UserId
@@ -252,7 +260,7 @@ Resources:
   ReportJobsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub messanger-report-jobs-${Environment}
+      TableName: !Sub ${AppName}-report-jobs-${Environment}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: JobId
@@ -264,7 +272,7 @@ Resources:
   NewsTrackingTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub messanger-news-tracking-${Environment}
+      TableName: !Sub ${AppName}-news-tracking-${Environment}
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: LinkHash
@@ -284,7 +292,7 @@ Resources:
   ImagesBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub messanger-images-${Environment}-${AWS::AccountId}
+      BucketName: !Sub ${AppName}-images-${Environment}-${AWS::AccountId}
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -299,7 +307,7 @@ Resources:
   ReportsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub messanger-reports-${Environment}-${AWS::AccountId}
+      BucketName: !Sub ${AppName}-reports-${Environment}-${AWS::AccountId}
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -315,7 +323,7 @@ Resources:
   ReportQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub messanger-report-jobs-${Environment}
+      QueueName: !Sub ${AppName}-report-jobs-${Environment}
       VisibilityTimeout: 300
       MessageRetentionPeriod: 86400
       RedrivePolicy:
@@ -325,14 +333,14 @@ Resources:
   ReportDLQ:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub messanger-report-jobs-dlq-${Environment}
+      QueueName: !Sub ${AppName}-report-jobs-dlq-${Environment}
       MessageRetentionPeriod: 1209600
 
   # Secrets Manager for API Keys
   ApiSecrets:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub messanger-api-keys-${Environment}
+      Name: !Sub ${AppName}-api-keys-${Environment}
       SecretString: !Sub |
         {
           "ANTHROPIC_API_KEY": "${AnthropicApiKey}",
@@ -344,7 +352,7 @@ Resources:
   WorkerCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: !Sub messanger-worker-cluster-${Environment}
+      ClusterName: !Sub ${AppName}-worker-cluster-${Environment}
       CapacityProviders:
         - FARGATE
         - FARGATE_SPOT
@@ -358,21 +366,37 @@ Resources:
   WorkerTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub messanger-worker-${Environment}
+      Family: !Sub ${AppName}-worker-${Environment}
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
       Cpu: '1024'
       Memory: '2048'
       ExecutionRoleArn: !GetAtt WorkerExecutionRole.Arn
       TaskRoleArn: !GetAtt WorkerTaskRole.Arn
       ContainerDefinitions:
         - Name: worker
-          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/messanger-worker:latest
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}-worker:latest
           Essential: true
+          PortMappings:
+            - ContainerPort: !Ref HealthPort
+              Protocol: tcp
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub wget -q --spider http://localhost:${HealthPort}/health/live || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
           Environment:
             - Name: ENVIRONMENT
               Value: !Ref Environment
+            - Name: HEALTH_PORT
+              Value: !Ref HealthPort
             - Name: REPORT_QUEUE_URL
               Value: !Ref ReportQueue
             - Name: WEBSOCKET_API_ENDPOINT
@@ -385,7 +409,7 @@ Resources:
               Value: !Ref ReportsBucket
           Secrets:
             - Name: ANTHROPIC_API_KEY
-              ValueFrom: !Sub ${ApiSecrets}:ANTHROPIC_API_KEY::
+              ValueFrom: !Sub "${ApiSecrets}:ANTHROPIC_API_KEY::"
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -396,7 +420,7 @@ Resources:
   WorkerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /ecs/messanger-worker-${Environment}
+      LogGroupName: !Sub /ecs/${AppName}-worker-${Environment}
       RetentionInDays: 14
 
   WorkerExecutionRole:
@@ -461,90 +485,58 @@ Resources:
                 Action:
                   - execute-api:ManageConnections
                 Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: Messanger/Worker
+
+  # Security Group for Worker
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Security group for ${AppName} worker
+      GroupName: !Sub ${AppName}-worker-sg-${Environment}
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-worker-sg-${Environment}
 
   # Worker Service
   WorkerService:
     Type: AWS::ECS::Service
     Properties:
-      ServiceName: !Sub messanger-worker-${Environment}
+      ServiceName: !Sub ${AppName}-worker-${Environment}
       Cluster: !Ref WorkerCluster
       TaskDefinition: !Ref WorkerTaskDefinition
       DesiredCount: 1
-      LaunchType: FARGATE
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+        - CapacityProvider: FARGATE
+          Weight: 1
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
           Subnets:
-            - !Ref WorkerSubnet
+            - !Ref SubnetId
           SecurityGroups:
             - !Ref WorkerSecurityGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
 
-  # VPC for Worker (minimal)
-  WorkerVPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsHostnames: true
-      EnableDnsSupport: true
-      Tags:
-        - Key: Name
-          Value: !Sub messanger-worker-vpc-${Environment}
-
-  WorkerSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref WorkerVPC
-      CidrBlock: 10.0.1.0/24
-      MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [0, !GetAZs '']
-      Tags:
-        - Key: Name
-          Value: !Sub messanger-worker-subnet-${Environment}
-
-  WorkerInternetGateway:
-    Type: AWS::EC2::InternetGateway
-
-  WorkerVPCGatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref WorkerVPC
-      InternetGatewayId: !Ref WorkerInternetGateway
-
-  WorkerRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref WorkerVPC
-
-  WorkerRoute:
-    Type: AWS::EC2::Route
-    DependsOn: WorkerVPCGatewayAttachment
-    Properties:
-      RouteTableId: !Ref WorkerRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref WorkerInternetGateway
-
-  WorkerSubnetRouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref WorkerSubnet
-      RouteTableId: !Ref WorkerRouteTable
-
-  WorkerSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for worker
-      VpcId: !Ref WorkerVPC
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-
-  # ECR Repository for Worker Image
-  WorkerRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: messanger-worker
-      ImageScanningConfiguration:
-        ScanOnPush: true
+  # ECR Repository managed manually (not in CloudFormation)
+  # Create with: aws ecr create-repository --repository-name gtax-message-server-worker --region eu-north-1
 
 Outputs:
   WebSocketApiEndpoint:
@@ -567,4 +559,4 @@ Outputs:
 
   WorkerRepositoryUri:
     Description: ECR Repository URI for worker
-    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${WorkerRepository}
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}-worker

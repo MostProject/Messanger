@@ -1,25 +1,43 @@
 .PHONY: build build-lambda build-worker test deploy clean
 
+# Load .env file if it exists
+ifneq (,$(wildcard ./.env))
+    include .env
+    export
+endif
+
 # Variables
 AWS_REGION ?= us-east-1
 ENVIRONMENT ?= dev
-STACK_NAME = messanger-$(ENVIRONMENT)
+APP_NAME ?= messanger
+STACK_NAME = $(APP_NAME)-$(ENVIRONMENT)
+AWS_PROFILE ?= default
 
 # Build all
 build: build-lambda build-worker
 
-# Build Lambda functions
+# Build Lambda functions (use Git Bash or WSL on Windows)
 build-lambda:
 	@echo "Building Lambda functions..."
+ifeq ($(OS),Windows_NT)
+	@if not exist bin\connect mkdir bin\connect
+	@if not exist bin\disconnect mkdir bin\disconnect
+	@if not exist bin\message mkdir bin\message
+	powershell -Command "$$env:GOOS='linux'; $$env:GOARCH='arm64'; $$env:CGO_ENABLED='0'; go build -ldflags='-w -s' -o ./bin/connect/bootstrap ./cmd/lambda/connect"
+	powershell -Command "$$env:GOOS='linux'; $$env:GOARCH='arm64'; $$env:CGO_ENABLED='0'; go build -ldflags='-w -s' -o ./bin/disconnect/bootstrap ./cmd/lambda/disconnect"
+	powershell -Command "$$env:GOOS='linux'; $$env:GOARCH='arm64'; $$env:CGO_ENABLED='0'; go build -ldflags='-w -s' -o ./bin/message/bootstrap ./cmd/lambda/message"
+else
+	@mkdir -p bin/connect bin/disconnect bin/message
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-w -s" -o ./bin/connect/bootstrap ./cmd/lambda/connect
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-w -s" -o ./bin/disconnect/bootstrap ./cmd/lambda/disconnect
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-w -s" -o ./bin/message/bootstrap ./cmd/lambda/message
+endif
 	@echo "Lambda functions built successfully"
 
-# Build worker Docker image
+# Build worker Docker image (x86_64 for compatibility with claude-code)
 build-worker:
 	@echo "Building worker Docker image..."
-	docker build -t messanger-worker:latest -f cmd/worker/Dockerfile .
+	docker buildx build --platform linux/amd64 -t messanger-worker:latest -f cmd/worker/Dockerfile . --load
 	@echo "Worker image built successfully"
 
 # Run tests
@@ -27,28 +45,72 @@ test:
 	go test -v ./...
 
 # Deploy to AWS
-deploy: build
+deploy: build check-keys
 	@echo "Deploying to AWS..."
 	sam deploy \
 		--template-file infrastructure/template.yaml \
 		--stack-name $(STACK_NAME) \
 		--region $(AWS_REGION) \
 		--capabilities CAPABILITY_IAM \
+		--s3-bucket $(SAM_BUCKET) \
 		--parameter-overrides \
-			Environment=$(ENVIRONMENT) \
-			AnthropicApiKey=$(ANTHROPIC_API_KEY) \
-			GeminiApiKey=$(GEMINI_API_KEY) \
-			NewsApiKey=$(NEWS_API_KEY) \
-		--no-confirm-changeset
+			"Environment=$(ENVIRONMENT)" \
+			"AnthropicApiKey=$(ANTHROPIC_API_KEY)" \
+			"GeminiApiKey=$(GEMINI_API_KEY)" \
+			"NewsApiKey=$(NEWS_API_KEY)" \
+			"SubnetId=$(SUBNET_ID)" \
+			"VpcId=$(VPC_ID)" \
+			"AppName=$(APP_NAME)" \
+			"HealthPort=$(HEALTH_PORT)" \
+		--no-confirm-changeset \
+		--disable-rollback
 	@echo "Deployment complete"
+
+# Check required environment variables
+check-keys:
+ifndef ANTHROPIC_API_KEY
+	$(error ANTHROPIC_API_KEY is not set in .env)
+endif
+ifndef GEMINI_API_KEY
+	$(error GEMINI_API_KEY is not set in .env)
+endif
+ifndef NEWS_API_KEY
+	$(error NEWS_API_KEY is not set in .env)
+endif
 
 # Push worker image to ECR
 push-worker:
 	@echo "Pushing worker image to ECR..."
-	aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
-	docker tag messanger-worker:latest $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/messanger-worker:latest
-	docker push $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/messanger-worker:latest
+	aws ecr get-login-password --region $(AWS_REGION) --profile $(AWS_PROFILE) | docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+	docker tag messanger-worker:latest $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(APP_NAME)-worker:latest
+	docker push $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(APP_NAME)-worker:latest
 	@echo "Worker image pushed successfully"
+
+# Force ECS to deploy new image
+redeploy-worker:
+	@echo "Forcing ECS service to deploy new image..."
+	aws ecs update-service \
+		--cluster $(APP_NAME)-worker-cluster-$(ENVIRONMENT) \
+		--service $(APP_NAME)-worker-$(ENVIRONMENT) \
+		--force-new-deployment \
+		--region $(AWS_REGION)
+	@echo "Deployment started. Use 'make worker-status' to monitor"
+
+# Check worker service status
+worker-status:
+	@aws ecs describe-services \
+		--cluster $(APP_NAME)-worker-cluster-$(ENVIRONMENT) \
+		--services $(APP_NAME)-worker-$(ENVIRONMENT) \
+		--region $(AWS_REGION) \
+		--query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
+		--output table
+
+# View worker logs
+worker-logs:
+	aws logs tail /ecs/$(APP_NAME)-worker-$(ENVIRONMENT) --region $(AWS_REGION) --follow
+
+# Build, push, and redeploy worker
+update-worker: build-worker push-worker redeploy-worker
 
 # Full deployment (Lambda + Worker)
 deploy-all: deploy push-worker
@@ -56,8 +118,13 @@ deploy-all: deploy push-worker
 
 # Clean build artifacts
 clean:
+ifeq ($(OS),Windows_NT)
+	if exist bin rmdir /s /q bin
+	if exist .aws-sam rmdir /s /q .aws-sam
+else
 	rm -rf ./bin
 	rm -rf .aws-sam
+endif
 	go clean
 
 # Local development (no Docker required)
@@ -126,3 +193,8 @@ lint:
 fmt:
 	go fmt ./...
 	goimports -w .
+
+delete-stack:
+	@echo "Deleting CloudFormation stack $(STACK_NAME)..."
+	aws cloudformation delete-stack --stack-name $(STACK_NAME) --region $(AWS_REGION)
+	@echo "Stack deletion initiated."

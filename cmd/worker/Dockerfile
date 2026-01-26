@@ -14,7 +14,7 @@ RUN go mod download
 COPY . .
 
 # Build the worker
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-w -s" -o /worker ./cmd/worker
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /worker ./cmd/worker
 
 # Runtime stage
 FROM node:20-alpine
@@ -28,18 +28,17 @@ RUN npm install -g @anthropic-ai/claude-code
 COPY --from=builder /worker /app/worker
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-# Create non-root user
-RUN addgroup -g 1000 worker && \
-    adduser -u 1000 -G worker -s /bin/sh -D worker && \
-    chown -R worker:worker /app
+# Use existing node user (UID 1000) and fix ownership
+RUN chown -R node:node /app
 
-USER worker
+USER node
 
-# Expose health check port
-EXPOSE 8080
+# Default health check port (overridden by HEALTH_PORT env var at runtime)
+ENV HEALTH_PORT=1739
+EXPOSE 1739
 
-# Health check using HTTP endpoint
+# Health check - ECS task definition handles this, but keeping for local Docker runs
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget -q --spider http://localhost:8080/health/live || exit 1
+    CMD wget -q --spider http://localhost:${HEALTH_PORT}/health/live || exit 1
 
 ENTRYPOINT ["/app/worker"]

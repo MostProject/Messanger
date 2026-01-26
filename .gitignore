@@ -44,3 +44,4 @@ temp/
 
 # Build artifacts
 dist/
+DEPLOYMENT.md

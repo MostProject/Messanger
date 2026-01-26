@@ -32,7 +32,6 @@ const (
 	pollInterval         = 5 * time.Second
 	jobTimeout           = 5 * time.Minute
 	AIClientID           = 9999
-	healthCheckPort      = "8080"
 	version              = "1.0.0"
 	progressUpdatePeriod = 15 * time.Second
 )
@@ -104,7 +103,11 @@ func NewWorker() (*Worker, error) {
 	metrics := observability.NewMetrics(cwClient, "Messanger/Worker", env)
 
 	// Health check server
-	healthServer := health.NewServer(healthCheckPort, version)
+	healthPort := os.Getenv("HEALTH_PORT")
+	if healthPort == "" {
+		healthPort = "8080"
+	}
+	healthServer := health.NewServer(healthPort, version)
 
 	// Register health checkers
 	healthServer.RegisterChecker("sqs", health.SQSChecker(func(ctx context.Context) error {
