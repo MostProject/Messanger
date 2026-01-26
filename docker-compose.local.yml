@@ -1,0 +1,66 @@
+services:
+  # LocalStack for AWS services emulation (DynamoDB)
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=dynamodb
+      - DEBUG=0
+      - DATA_DIR=/var/lib/localstack/data
+      - PERSISTENCE=1
+    volumes:
+      - "./local/localstack:/var/lib/localstack"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Initialize DynamoDB tables
+  localstack-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo 'Creating DynamoDB tables...'
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table --table-name messanger-connections --attribute-definitions AttributeName=ConnectionId,AttributeType=S AttributeName=UserId,AttributeType=N --key-schema AttributeName=ConnectionId,KeyType=HASH --global-secondary-indexes '[{"IndexName":"UserId-index","KeySchema":[{"AttributeName":"UserId","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}]' --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 || true
+        aws --endpoint-url=http://localstack:4566 dynamodb create-table --table-name messanger-conversations --attribute-definitions AttributeName=ConversationId,AttributeType=S AttributeName=MessageId,AttributeType=N --key-schema AttributeName=ConversationId,KeyType=HASH AttributeName=MessageId,KeyType=RANGE --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 || true
+        echo 'DynamoDB tables created!'
+        aws --endpoint-url=http://localstack:4566 dynamodb list-tables
+
+  # Go WebSocket Server
+  messanger:
+    build:
+      context: .
+      dockerfile: cmd/local/Dockerfile
+    depends_on:
+      localstack-init:
+        condition: service_completed_successfully
+    ports:
+      - "1738:1738"   # WebSocket
+      - "1739:1739"   # Health check
+    environment:
+      - AWS_ENDPOINT=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - USE_DYNAMODB=true
+      - LOG_LEVEL=debug
+      - HEALTH_PORT=1739
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:1739/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  localstack:

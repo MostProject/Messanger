@@ -17,13 +17,24 @@ import (
 	"github.com/MostProject/Messanger/internal/health"
 	"github.com/MostProject/Messanger/internal/models"
 	"github.com/MostProject/Messanger/internal/observability"
+	"github.com/MostProject/Messanger/internal/storage"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/gorilla/websocket"
 )
 
-const (
+var (
 	wsPort     = "1738"
 	healthPort = "8080"
 )
+
+func init() {
+	if p := os.Getenv("HEALTH_PORT"); p != "" {
+		healthPort = p
+	}
+}
 
 // MockStore provides in-memory storage for local testing
 type MockStore struct {
@@ -41,18 +52,30 @@ func NewMockStore() *MockStore {
 	}
 }
 
+// Storage interface for the local server
+type Storage interface {
+	SaveConnection(ctx context.Context, conn *models.Connection) error
+	DeleteConnection(ctx context.Context, connectionID string) error
+	GetConnectionByUserID(ctx context.Context, userID int) (*models.Connection, error)
+	GetAllConnections(ctx context.Context) ([]models.Connection, error)
+	SaveMessage(ctx context.Context, msg *models.IncomingMessage) (int, error)
+	GetConversation(ctx context.Context, user1, user2, limit int, lastMsgID int) ([]models.BroadcastMessage, bool, error)
+}
+
 // LocalServer runs a local development server
 type LocalServer struct {
-	store    *MockStore
-	wsConns  map[string]*websocket.Conn
+	store     *MockStore      // In-memory store (always used for connections map)
+	dynamo    *storage.DynamoDBStore // Optional DynamoDB for persistence
+	useDynamo bool
+	wsConns   map[string]*websocket.Conn
 	wsConnsMu sync.RWMutex
-	upgrader websocket.Upgrader
-	logger   *observability.Logger
-	health   *health.Server
+	upgrader  websocket.Upgrader
+	logger    *observability.Logger
+	health    *health.Server
 }
 
 func NewLocalServer() *LocalServer {
-	return &LocalServer{
+	server := &LocalServer{
 		store:   NewMockStore(),
 		wsConns: make(map[string]*websocket.Conn),
 		upgrader: websocket.Upgrader{
@@ -61,6 +84,48 @@ func NewLocalServer() *LocalServer {
 		logger: observability.NewLogger("local-server", observability.LevelDebug),
 		health: health.NewServer(healthPort, "local-dev"),
 	}
+
+	// Check if DynamoDB should be used
+	if os.Getenv("USE_DYNAMODB") == "true" {
+		ctx := context.Background()
+		endpoint := os.Getenv("AWS_ENDPOINT")
+
+		var cfg aws.Config
+		var err error
+
+		if endpoint != "" {
+			// Local development with LocalStack
+			cfg, err = config.LoadDefaultConfig(ctx,
+				config.WithRegion("us-east-1"),
+				config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+			)
+			if err == nil {
+				dynamoClient := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+					o.BaseEndpoint = aws.String(endpoint)
+				})
+				server.dynamo = storage.NewDynamoDBStore(dynamoClient)
+				server.useDynamo = true
+				server.logger.Info(ctx, "DynamoDB storage enabled", map[string]interface{}{
+					"endpoint": endpoint,
+				})
+			}
+		} else {
+			// Real AWS
+			cfg, err = config.LoadDefaultConfig(ctx)
+			if err == nil {
+				dynamoClient := dynamodb.NewFromConfig(cfg)
+				server.dynamo = storage.NewDynamoDBStore(dynamoClient)
+				server.useDynamo = true
+				server.logger.Info(ctx, "DynamoDB storage enabled (AWS)", nil)
+			}
+		}
+
+		if err != nil {
+			server.logger.Error(ctx, "Failed to initialize DynamoDB, using in-memory storage", err, nil)
+		}
+	}
+
+	return server
 }
 
 func (s *LocalServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +192,8 @@ func (s *LocalServer) handleMessage(ctx context.Context, connID string, message 
 		s.handleRegistration(ctx, connID, message)
 	case models.TypeActiveClients:
 		s.handleActiveClients(ctx, connID)
+	case models.TypeConversationRequest:
+		s.handleConversationRequest(ctx, connID, message)
 	case models.TypePong:
 		s.logger.Debug(ctx, "Received pong", nil)
 	default:
@@ -141,11 +208,18 @@ func (s *LocalServer) handleRegistration(ctx context.Context, connID string, mes
 		return
 	}
 
-	ctx = observability.WithUserID(ctx, reg.UserID)
+	// C# client sends ProgramId as the user identifier
+	// Use ProgramId as UserID if UserID is not provided
+	userID := reg.UserID
+	if userID == 0 {
+		userID = reg.ProgramID
+	}
+
+	ctx = observability.WithUserID(ctx, userID)
 
 	conn := &models.Connection{
 		ConnectionID: connID,
-		UserID:       reg.UserID,
+		UserID:       userID,
 		SystemID:     reg.SystemID,
 		ProgramID:    reg.ProgramID,
 		Username:     reg.Username,
@@ -157,34 +231,90 @@ func (s *LocalServer) handleRegistration(ctx context.Context, connID string, mes
 	s.store.connections[connID] = conn
 	s.store.mu.Unlock()
 
+	// Send response in format expected by C# client
 	s.sendToConnection(connID, map[string]interface{}{
-		"MessageType": "registration_success",
-		"UserId":      reg.UserID,
+		"MessageType": "registration_response",
+		"Success":     true,
 		"Message":     "Registration successful",
+		"UserId":      userID,
 	})
 
 	s.logger.Info(ctx, "Client registered", map[string]interface{}{
-		"user_id":  reg.UserID,
-		"username": reg.Username,
+		"user_id":    userID,
+		"program_id": reg.ProgramID,
+		"system_id":  reg.SystemID,
+		"username":   reg.Username,
 	})
 }
 
 func (s *LocalServer) handleActiveClients(ctx context.Context, connID string) {
 	s.store.mu.RLock()
-	users := make([]models.UserStatus, 0, len(s.store.connections))
+	// C# client expects ActiveProgramIds (list of ints), not UserStatus objects
+	programIds := make([]int, 0, len(s.store.connections))
 	for _, conn := range s.store.connections {
-		users = append(users, models.UserStatus{
-			UserID:     conn.UserID,
-			Username:   conn.Username,
-			IsOnline:   true,
-			LastSeenAt: conn.LastPingAt,
-		})
+		programIds = append(programIds, conn.ProgramID)
 	}
 	s.store.mu.RUnlock()
 
 	s.sendToConnection(connID, map[string]interface{}{
-		"MessageType":   "active_clients_response",
-		"ActiveClients": users,
+		"MessageType":      "active_clients_response",
+		"ActiveProgramIds": programIds,
+		"TotalCount":       len(programIds),
+		"Success":          true,
+		"ErrorMessage":     "",
+	})
+}
+
+// ConversationRequest message structure
+type ConversationRequest struct {
+	MessageType   string `json:"MessageType"`
+	WithProgramId int    `json:"WithProgramId"`
+}
+
+func (s *LocalServer) handleConversationRequest(ctx context.Context, connID string, message []byte) {
+	var req ConversationRequest
+	if err := json.Unmarshal(message, &req); err != nil {
+		s.logger.Error(ctx, "Invalid conversation request", err, nil)
+		return
+	}
+
+	// Get the requesting user's ID from the connection
+	s.store.mu.RLock()
+	conn := s.store.connections[connID]
+	s.store.mu.RUnlock()
+
+	var requestingUserID int
+	if conn != nil {
+		requestingUserID = conn.ProgramID
+	}
+
+	s.logger.Info(ctx, "Conversation request", map[string]interface{}{
+		"from_user":       requestingUserID,
+		"with_program_id": req.WithProgramId,
+	})
+
+	var messages []models.BroadcastMessage
+
+	// Fetch from DynamoDB if enabled
+	if s.useDynamo && s.dynamo != nil && requestingUserID > 0 {
+		var err error
+		messages, _, err = s.dynamo.GetConversation(ctx, requestingUserID, req.WithProgramId, 50, 0)
+		if err != nil {
+			s.logger.Error(ctx, "Failed to fetch conversation from DynamoDB", err, nil)
+			messages = []models.BroadcastMessage{}
+		}
+	} else {
+		messages = []models.BroadcastMessage{}
+	}
+
+	// C# expects: MessageType, WithProgramId, Messages (array), Success, ErrorMessage, UnseenMessageCount
+	s.sendToConnection(connID, map[string]interface{}{
+		"MessageType":        "conversation_response",
+		"WithProgramId":      req.WithProgramId,
+		"Messages":           messages,
+		"Success":            true,
+		"ErrorMessage":       "",
+		"UnseenMessageCount": 0,
 	})
 }
 
@@ -195,14 +325,25 @@ func (s *LocalServer) handleChatMessage(ctx context.Context, connID string, mess
 		return
 	}
 
-	// Generate message ID
-	msgID := int(time.Now().UnixNano() % 1000000)
+	// Generate message ID or save to DynamoDB
+	var msgID int
+	if s.useDynamo && s.dynamo != nil {
+		var err error
+		msgID, err = s.dynamo.SaveMessage(ctx, &msg)
+		if err != nil {
+			s.logger.Error(ctx, "Failed to save message to DynamoDB", err, nil)
+			msgID = int(time.Now().UnixNano() % 1000000)
+		}
+	} else {
+		msgID = int(time.Now().UnixNano() % 1000000)
+	}
 
-	// Save message (mock)
 	s.logger.Info(ctx, "Chat message", map[string]interface{}{
-		"from":    msg.MesajGonderenKullaniciID,
-		"to":      msg.MesajAliciKullaniciID,
-		"content": truncate(msg.MesajIcerik, 50),
+		"from":       msg.MesajGonderenKullaniciID,
+		"to":         msg.MesajAliciKullaniciID,
+		"content":    truncate(msg.MesajIcerik, 50),
+		"message_id": msgID,
+		"persisted":  s.useDynamo,
 	})
 
 	// Send confirmation
@@ -221,13 +362,30 @@ func (s *LocalServer) handleChatMessage(ctx context.Context, connID string, mess
 		IsSeenByRecipient:        false,
 	}
 
-	// Find recipient connection
+	// Find recipient connection and deliver message
 	s.store.mu.RLock()
+	delivered := false
 	for cid, conn := range s.store.connections {
-		if conn.UserID == msg.MesajAliciKullaniciID {
-			s.sendToConnection(cid, broadcast)
+		if conn.ProgramID == msg.MesajAliciKullaniciID {
+			if err := s.sendToConnection(cid, broadcast); err != nil {
+				s.logger.Error(ctx, "Failed to deliver message", err, map[string]interface{}{
+					"recipient_id": msg.MesajAliciKullaniciID,
+				})
+			} else {
+				s.logger.Info(ctx, "Message delivered", map[string]interface{}{
+					"from":         msg.MesajGonderenKullaniciID,
+					"to":           msg.MesajAliciKullaniciID,
+					"recipient_conn": cid,
+				})
+				delivered = true
+			}
 			break
 		}
+	}
+	if !delivered && msg.MesajAliciKullaniciID != handlers.AIClientID {
+		s.logger.Warn(ctx, "Recipient not connected", map[string]interface{}{
+			"recipient_id": msg.MesajAliciKullaniciID,
+		})
 	}
 	s.store.mu.RUnlock()
 
