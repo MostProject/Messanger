@@ -196,5 +196,23 @@ fmt:
 
 delete-stack:
 	@echo "Deleting CloudFormation stack $(STACK_NAME)..."
-	aws cloudformation delete-stack --stack-name $(STACK_NAME) --region $(AWS_REGION)
+	aws cloudformation delete-stack --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE)
 	@echo "Stack deletion initiated."
+
+# Fix stuck/failed CloudFormation stack
+fix-stack:
+	@echo "Attempting to fix CloudFormation stack $(STACK_NAME)..."
+	@aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].StackStatus" --output text
+	aws cloudformation rollback-stack --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE) || true
+	@echo "Waiting for rollback..."
+	aws cloudformation wait stack-rollback-complete --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE) || true
+	@echo "Stack status:"
+	@aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].StackStatus" --output text
+
+# Check stack status
+stack-status:
+	@aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].{Status:StackStatus,Reason:StackStatusReason}" --output table
+
+# View stack events (errors)
+stack-events:
+	@aws cloudformation describe-stack-events --stack-name $(STACK_NAME) --region $(AWS_REGION) --profile $(AWS_PROFILE) --query "StackEvents[?ResourceStatus=='CREATE_FAILED' || ResourceStatus=='UPDATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" --output table

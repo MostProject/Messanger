@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -16,17 +17,27 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-const (
-	ConnectionsTable     = "messanger-connections"
-	ConversationsTable   = "messanger-conversations"
-	AnnouncementsTable   = "messanger-announcements"
-	ReportJobsTable      = "messanger-report-jobs"
-	NewsTrackingTable    = "messanger-news-tracking"
+// Table names from environment variables
+var (
+	ConnectionsTable    = getEnvOrDefault("CONNECTIONS_TABLE", "messanger-connections")
+	ConversationsTable  = getEnvOrDefault("CONVERSATIONS_TABLE", "messanger-conversations")
+	AnnouncementsTable  = getEnvOrDefault("ANNOUNCEMENTS_TABLE", "messanger-announcements")
+	ReportJobsTable     = getEnvOrDefault("REPORT_JOBS_TABLE", "messanger-report-jobs")
+	NewsTrackingTable   = getEnvOrDefault("NEWS_TRACKING_TABLE", "messanger-news-tracking")
+)
 
+const (
 	DefaultTTLDays       = 30
 	ConnectionTTLMinutes = 60
 	MaxBatchSize         = 25 // DynamoDB batch write limit
 )
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 // DynamoDBStore handles all DynamoDB operations
 type DynamoDBStore struct {

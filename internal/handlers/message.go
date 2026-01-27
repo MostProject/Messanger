@@ -107,11 +107,12 @@ func (h *MessageHandler) handleRegistration(ctx context.Context, connectionID st
 		return h.wsService.SendError(ctx, connectionID, "registration_error", "Failed to register")
 	}
 
-	// Send registration success
+	// Send registration success - format must match what C# client expects
 	response := map[string]interface{}{
-		"MessageType": "registration_success",
-		"UserId":      reg.UserID,
+		"MessageType": "registration_response",
+		"Success":     true,
 		"Message":     "Registration successful",
+		"UserId":      reg.UserID,
 	}
 	if err := h.wsService.SendToConnection(ctx, connectionID, response); err != nil {
 		return err

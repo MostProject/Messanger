@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,12 +13,23 @@ import (
 	"github.com/google/uuid"
 )
 
+// Bucket names from environment variables
+var (
+	ImagesBucket  = getEnvOrDefaultS3("IMAGES_BUCKET", "messanger-images")
+	ReportsBucket = getEnvOrDefaultS3("REPORTS_BUCKET", "messanger-reports")
+)
+
 const (
-	ImagesBucket         = "messanger-images"
-	ReportsBucket        = "messanger-reports"
 	MaxImageSizeBytes    = 5 * 1024 * 1024 // 5MB
 	PresignedURLDuration = 15 * time.Minute
 )
+
+func getEnvOrDefaultS3(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
 // S3Store handles S3 operations
 type S3Store struct {
