@@ -196,6 +196,12 @@ func (s *LocalServer) handleMessage(ctx context.Context, connID string, message 
 		s.handleConversationRequest(ctx, connID, message)
 	case models.TypePong:
 		s.logger.Debug(ctx, "Received pong", nil)
+	case models.TypeErrorLog:
+		s.handleErrorLog(ctx, connID, message)
+	case models.TypeImageUpload:
+		s.handleImageUpload(ctx, connID, message)
+	case models.TypeImageDownload:
+		s.handleImageDownload(ctx, connID, message)
 	default:
 		s.handleChatMessage(ctx, connID, message)
 	}
@@ -217,6 +223,28 @@ func (s *LocalServer) handleRegistration(ctx context.Context, connID string, mes
 
 	ctx = observability.WithUserID(ctx, userID)
 
+	// Check for duplicate SystemId-ProgramId combination (matching MessageServer C# behavior)
+	if reg.SystemID != "" {
+		s.store.mu.RLock()
+		for existingConnID, existingConn := range s.store.connections {
+			if existingConn.SystemID == reg.SystemID && existingConnID != connID {
+				s.store.mu.RUnlock()
+				s.logger.Warn(ctx, "SystemId-ProgramId already registered, rejecting", map[string]interface{}{
+					"system_id":        reg.SystemID,
+					"existing_conn_id": existingConnID,
+					"new_conn_id":      connID,
+				})
+				s.sendToConnection(connID, map[string]interface{}{
+					"MessageType": "registration_response",
+					"Success":     false,
+					"Message":     "SystemId-ProgramId combination already in use",
+				})
+				return
+			}
+		}
+		s.store.mu.RUnlock()
+	}
+
 	conn := &models.Connection{
 		ConnectionID: connID,
 		UserID:       userID,
@@ -236,7 +264,6 @@ func (s *LocalServer) handleRegistration(ctx context.Context, connID string, mes
 		"MessageType": "registration_response",
 		"Success":     true,
 		"Message":     "Registration successful",
-		"UserId":      userID,
 	})
 
 	s.logger.Info(ctx, "Client registered", map[string]interface{}{
@@ -315,6 +342,96 @@ func (s *LocalServer) handleConversationRequest(ctx context.Context, connID stri
 		"Success":            true,
 		"ErrorMessage":       "",
 		"UnseenMessageCount": 0,
+	})
+}
+
+func (s *LocalServer) handleErrorLog(ctx context.Context, connID string, message []byte) {
+	var errLog models.ErrorLogMessage
+	if err := json.Unmarshal(message, &errLog); err != nil {
+		s.sendToConnection(connID, map[string]interface{}{
+			"MessageType": "error_log_response",
+			"Success":     false,
+			"Message":     "Invalid error log format",
+		})
+		return
+	}
+
+	s.logger.Warn(ctx, "Client error logged", map[string]interface{}{
+		"error_type":    errLog.ErrorType,
+		"error_message": errLog.ErrorMessage,
+	})
+
+	s.sendToConnection(connID, map[string]interface{}{
+		"MessageType": "error_log_response",
+		"Success":     true,
+		"Message":     "Error logged successfully",
+	})
+}
+
+func (s *LocalServer) handleImageUpload(ctx context.Context, connID string, message []byte) {
+	var img models.ImageMessage
+	if err := json.Unmarshal(message, &img); err != nil {
+		s.sendError(connID, "image_error", "Invalid image format")
+		return
+	}
+
+	// Generate a mock image ID for local dev
+	imageID := fmt.Sprintf("img_%d_%d_%d", img.MesajGonderenKullaniciID, img.MesajAliciKullaniciID, time.Now().UnixNano())
+
+	s.logger.Info(ctx, "Image upload", map[string]interface{}{
+		"from":       img.MesajGonderenKullaniciID,
+		"to":         img.MesajAliciKullaniciID,
+		"image_name": img.ImageName,
+		"image_size": img.ImageSize,
+		"image_id":   imageID,
+	})
+
+	// Create image placeholder message (matching C# MessageServer format)
+	placeholder := map[string]interface{}{
+		"MessageType":              "image_placeholder",
+		"ImageId":                  imageID,
+		"ImageName":                img.ImageName,
+		"ImageSize":                img.ImageSize,
+		"Mesaj_GonderenKullaniciId": img.MesajGonderenKullaniciID,
+		"Mesaj_AliciKullaniciId":   img.MesajAliciKullaniciID,
+		"Mesaj_GonderilenTarih":    img.MesajGonderilenTarih,
+	}
+
+	// Route placeholder to recipient
+	s.store.mu.RLock()
+	for cid, conn := range s.store.connections {
+		if conn.ProgramID == img.MesajAliciKullaniciID {
+			s.sendToConnection(cid, placeholder)
+			break
+		}
+	}
+	s.store.mu.RUnlock()
+
+	// Send confirmation to sender
+	s.sendToConnection(connID, map[string]interface{}{
+		"MessageType": "image_upload_success",
+		"ImageId":     imageID,
+	})
+}
+
+func (s *LocalServer) handleImageDownload(ctx context.Context, connID string, message []byte) {
+	var req struct {
+		MessageType string `json:"MessageType"`
+		ImageId     string `json:"ImageId"`
+	}
+	if err := json.Unmarshal(message, &req); err != nil {
+		s.sendError(connID, "image_error", "Invalid request format")
+		return
+	}
+
+	// In local dev, we don't have actual image storage, send a not-found response
+	s.sendToConnection(connID, map[string]interface{}{
+		"MessageType": "image_download_response",
+		"Success":     false,
+		"Message":     "Image storage not available in local dev mode",
+		"ImageId":     req.ImageId,
+		"ImageData":   "",
+		"ImageName":   "",
 	})
 }
 

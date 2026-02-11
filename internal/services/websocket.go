@@ -127,37 +127,70 @@ func (s *WebSocketService) SendReport(ctx context.Context, userID int, report *m
 }
 
 // SendActiveClients sends the list of active clients to a user
+// Format matches MessageServer C#: returns ActiveProgramIds (list of ints), not UserStatus objects
 func (s *WebSocketService) SendActiveClients(ctx context.Context, connectionID string) error {
 	connections, err := s.store.GetAllConnections(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get connections: %w", err)
+		// Send error response in expected format
+		errorResp := map[string]interface{}{
+			"MessageType":      "active_clients_response",
+			"ActiveProgramIds": []int{},
+			"TotalCount":       0,
+			"Success":          false,
+			"ErrorMessage":     "Failed to get active clients",
+		}
+		return s.SendToConnection(ctx, connectionID, errorResp)
 	}
 
-	users := make([]models.UserStatus, 0, len(connections))
+	// Collect unique ProgramIDs (matching C# behavior)
+	seen := make(map[int]bool)
+	programIds := make([]int, 0, len(connections))
 	for _, conn := range connections {
-		users = append(users, models.UserStatus{
-			UserID:     conn.UserID,
-			Username:   conn.Username,
-			IsOnline:   true,
-			LastSeenAt: conn.LastPingAt,
-		})
+		pid := conn.ProgramID
+		if pid == 0 {
+			pid = conn.UserID
+		}
+		if !seen[pid] {
+			seen[pid] = true
+			programIds = append(programIds, pid)
+		}
 	}
 
-	response := models.ActiveClientsResponse{
-		MessageType:   "active_clients_response",
-		ActiveClients: users,
+	response := map[string]interface{}{
+		"MessageType":      "active_clients_response",
+		"ActiveProgramIds": programIds,
+		"TotalCount":       len(programIds),
+		"Success":          true,
+		"ErrorMessage":     "",
 	}
 
 	return s.SendToConnection(ctx, connectionID, response)
 }
 
 // SendConversation sends conversation history to a user
-func (s *WebSocketService) SendConversation(ctx context.Context, connectionID string, messages []models.BroadcastMessage, hasMore bool) error {
-	response := models.ConversationResponse{
-		MessageType: "conversation_response",
-		Messages:    messages,
-		HasMore:     hasMore,
-		TotalCount:  len(messages),
+// Format matches MessageServer C#: WithProgramId, Messages, UnseenMessageCount, Success, ErrorMessage
+func (s *WebSocketService) SendConversation(ctx context.Context, connectionID string, withProgramId int, messages []models.BroadcastMessage, unseenCount int) error {
+	response := map[string]interface{}{
+		"MessageType":        "conversation_response",
+		"WithProgramId":      withProgramId,
+		"Messages":           messages,
+		"UnseenMessageCount": unseenCount,
+		"Success":            true,
+		"ErrorMessage":       "",
+	}
+
+	return s.SendToConnection(ctx, connectionID, response)
+}
+
+// SendConversationError sends a conversation error response
+func (s *WebSocketService) SendConversationError(ctx context.Context, connectionID string, withProgramId int, errorMessage string) error {
+	response := map[string]interface{}{
+		"MessageType":        "conversation_response",
+		"WithProgramId":      withProgramId,
+		"Messages":           []models.BroadcastMessage{},
+		"UnseenMessageCount": 0,
+		"Success":            false,
+		"ErrorMessage":       errorMessage,
 	}
 
 	return s.SendToConnection(ctx, connectionID, response)

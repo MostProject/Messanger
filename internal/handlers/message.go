@@ -86,17 +86,54 @@ func (h *MessageHandler) HandleMessage(ctx context.Context, connectionID string,
 }
 
 // handleRegistration processes client registration
+// Mirrors MessageServer C# behavior: checks for duplicate SystemId-ProgramId before allowing registration
 func (h *MessageHandler) handleRegistration(ctx context.Context, connectionID string, body string) error {
 	var reg models.RegistrationMessage
 	if err := json.Unmarshal([]byte(body), &reg); err != nil {
 		return h.wsService.SendError(ctx, connectionID, "registration_error", "Invalid registration format")
 	}
 
+	// Parse SystemId to extract systemId and programId (format: "clientId-programId")
+	systemID := reg.SystemID
+	programID := reg.ProgramID
+
+	// If SystemId contains the combined format, parse it
+	if systemID != "" && strings.Contains(systemID, "-") {
+		parts := strings.SplitN(systemID, "-", 2)
+		if len(parts) == 2 {
+			if pid, err := fmt.Sscanf(parts[1], "%d", &programID); err == nil && pid > 0 {
+				// Use the parsed ProgramID from SystemId
+			}
+		}
+	}
+
+	// Check for duplicate SystemId-ProgramId combination (same as MessageServer C#)
+	if systemID != "" {
+		existingConn, err := h.store.GetConnectionBySystemID(ctx, systemID)
+		if err != nil {
+			log.Printf("Warning: failed to check for duplicate SystemID: %v", err)
+		} else if existingConn != nil && existingConn.ConnectionID != connectionID {
+			log.Printf("SystemId-ProgramId %s already registered, rejecting client %s", systemID, connectionID)
+			response := map[string]interface{}{
+				"MessageType": "registration_response",
+				"Success":     false,
+				"Message":     "SystemId-ProgramId combination already in use",
+			}
+			return h.wsService.SendToConnection(ctx, connectionID, response)
+		}
+	}
+
+	// C# client sends ProgramId as the user identifier
+	userID := reg.UserID
+	if userID == 0 {
+		userID = programID
+	}
+
 	conn := &models.Connection{
 		ConnectionID: connectionID,
-		UserID:       reg.UserID,
-		SystemID:     reg.SystemID,
-		ProgramID:    reg.ProgramID,
+		UserID:       userID,
+		SystemID:     systemID,
+		ProgramID:    programID,
 		Username:     reg.Username,
 		ConnectedAt:  time.Now().UTC(),
 		LastPingAt:   time.Now().UTC(),
@@ -104,7 +141,12 @@ func (h *MessageHandler) handleRegistration(ctx context.Context, connectionID st
 
 	if err := h.store.SaveConnection(ctx, conn); err != nil {
 		log.Printf("Failed to save connection: %v", err)
-		return h.wsService.SendError(ctx, connectionID, "registration_error", "Failed to register")
+		response := map[string]interface{}{
+			"MessageType": "registration_response",
+			"Success":     false,
+			"Message":     "Registration failed",
+		}
+		return h.wsService.SendToConnection(ctx, connectionID, response)
 	}
 
 	// Send registration success - format must match what C# client expects
@@ -112,53 +154,93 @@ func (h *MessageHandler) handleRegistration(ctx context.Context, connectionID st
 		"MessageType": "registration_response",
 		"Success":     true,
 		"Message":     "Registration successful",
-		"UserId":      reg.UserID,
 	}
 	if err := h.wsService.SendToConnection(ctx, connectionID, response); err != nil {
 		return err
 	}
 
 	// Deliver any pending announcements
-	pendingAnnouncements, err := h.store.GetPendingAnnouncements(ctx, reg.UserID)
+	pendingAnnouncements, err := h.store.GetPendingAnnouncements(ctx, userID)
 	if err != nil {
 		log.Printf("Failed to get pending announcements: %v", err)
 	} else {
 		for _, pa := range pendingAnnouncements {
-			if err := h.wsService.SendAnnouncement(ctx, &pa.Announcement, &reg.UserID); err == nil {
-				h.store.MarkAnnouncementDelivered(ctx, reg.UserID, pa.AnnouncementID)
+			if err := h.wsService.SendAnnouncement(ctx, &pa.Announcement, &userID); err == nil {
+				h.store.MarkAnnouncementDelivered(ctx, userID, pa.AnnouncementID)
 			}
 		}
 	}
 
-	log.Printf("Client registered: UserID=%d, SystemID=%s, ConnectionID=%s", reg.UserID, reg.SystemID, connectionID)
+	log.Printf("Client registered: UserID=%d, SystemID=%s, ProgramID=%d, ConnectionID=%s", userID, systemID, programID, connectionID)
 	return nil
 }
 
 // handleConversationRequest retrieves conversation history
+// Supports both formats:
+// - C# client format: { MessageType, WithProgramId }
+// - Legacy format: { MessageType, Mesaj_GonderenKullaniciId, Mesaj_AliciKullaniciId }
 func (h *MessageHandler) handleConversationRequest(ctx context.Context, connectionID string, body string) error {
-	var req models.ConversationRequest
-	if err := json.Unmarshal([]byte(body), &req); err != nil {
-		return h.wsService.SendError(ctx, connectionID, "conversation_error", "Invalid request format")
+	// Try to parse both formats
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return h.wsService.SendConversationError(ctx, connectionID, 0, "Invalid request format")
 	}
 
-	messages, hasMore, err := h.store.GetConversation(
+	var requestingProgramID, withProgramID int
+
+	// Check if this is the C# client format (WithProgramId)
+	if wpRaw, ok := raw["WithProgramId"]; ok {
+		json.Unmarshal(wpRaw, &withProgramID)
+
+		// Look up the requesting user's ProgramID from their connection
+		conn, err := h.store.GetConnectionByConnectionID(ctx, connectionID)
+		if err != nil || conn == nil {
+			return h.wsService.SendConversationError(ctx, connectionID, withProgramID, "Client not registered")
+		}
+		requestingProgramID = conn.ProgramID
+		if requestingProgramID == 0 {
+			requestingProgramID = conn.UserID
+		}
+	} else {
+		// Legacy format
+		var req models.ConversationRequest
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			return h.wsService.SendConversationError(ctx, connectionID, 0, "Invalid request format")
+		}
+		requestingProgramID = req.MesajGonderenKullaniciID
+		withProgramID = req.MesajAliciKullaniciID
+	}
+
+	if withProgramID == 0 {
+		return h.wsService.SendConversationError(ctx, connectionID, 0, "Invalid program ID")
+	}
+
+	messages, _, err := h.store.GetConversation(
 		ctx,
-		req.MesajGonderenKullaniciID,
-		req.MesajAliciKullaniciID,
-		req.Limit,
-		req.LastMessageID,
+		requestingProgramID,
+		withProgramID,
+		50, // Default limit matching C# server
+		0,
 	)
 	if err != nil {
 		log.Printf("Failed to get conversation: %v", err)
-		return h.wsService.SendError(ctx, connectionID, "conversation_error", "Failed to retrieve conversation")
+		return h.wsService.SendConversationError(ctx, connectionID, withProgramID, "Failed to retrieve conversation")
+	}
+
+	// Count unseen messages (messages sent BY the other user that haven't been seen)
+	unseenCount := 0
+	for i := range messages {
+		if messages[i].MesajGonderenKullaniciID == withProgramID && !messages[i].IsSeenByRecipient {
+			unseenCount++
+		}
 	}
 
 	// Mark messages as seen (best effort - don't fail if this fails)
-	if err := h.store.MarkMessagesSeen(ctx, req.MesajGonderenKullaniciID, req.MesajAliciKullaniciID); err != nil {
+	if err := h.store.MarkMessagesSeen(ctx, requestingProgramID, withProgramID); err != nil {
 		log.Printf("Warning: failed to mark messages as seen: %v", err)
 	}
 
-	return h.wsService.SendConversation(ctx, connectionID, messages, hasMore)
+	return h.wsService.SendConversation(ctx, connectionID, withProgramID, messages, unseenCount)
 }
 
 // handleActiveClientsRequest returns list of online users
@@ -354,15 +436,28 @@ func (h *MessageHandler) handleSchemaResponse(ctx context.Context, connectionID 
 	return h.queue.EnqueueReportJob(ctx, job)
 }
 
-// handleErrorLog stores client error logs
+// handleErrorLog stores client error logs and sends response
+// Matches MessageServer C# behavior: logs the error and sends error_log_response
 func (h *MessageHandler) handleErrorLog(ctx context.Context, connectionID string, body string) error {
 	var errLog models.ErrorLogMessage
 	if err := json.Unmarshal([]byte(body), &errLog); err != nil {
-		return nil // Silently ignore invalid error logs
+		response := map[string]interface{}{
+			"MessageType": "error_log_response",
+			"Success":     false,
+			"Message":     "Invalid error log format",
+		}
+		return h.wsService.SendToConnection(ctx, connectionID, response)
 	}
 
 	log.Printf("Client error [%s]: %s - %s", errLog.ErrorType, errLog.ErrorMessage, errLog.StackTrace)
-	return nil
+
+	// Send success response back to client (matching C# MessageServer behavior)
+	response := map[string]interface{}{
+		"MessageType": "error_log_response",
+		"Success":     true,
+		"Message":     "Error logged successfully",
+	}
+	return h.wsService.SendToConnection(ctx, connectionID, response)
 }
 
 // handleChatMessage processes regular chat messages

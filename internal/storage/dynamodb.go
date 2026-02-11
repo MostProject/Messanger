@@ -146,6 +146,54 @@ func (s *DynamoDBStore) UpdateConnectionPing(ctx context.Context, connectionID s
 	return err
 }
 
+// GetConnectionByConnectionID finds a connection by its connection ID (primary key)
+func (s *DynamoDBStore) GetConnectionByConnectionID(ctx context.Context, connectionID string) (*models.Connection, error) {
+	result, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(ConnectionsTable),
+		Key: map[string]types.AttributeValue{
+			"ConnectionId": &types.AttributeValueMemberS{Value: connectionID},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Item == nil {
+		return nil, nil
+	}
+
+	var conn models.Connection
+	if err := attributevalue.UnmarshalMap(result.Item, &conn); err != nil {
+		return nil, err
+	}
+	return &conn, nil
+}
+
+// GetConnectionBySystemID finds a connection by the SystemId field (format: "clientId-programId")
+func (s *DynamoDBStore) GetConnectionBySystemID(ctx context.Context, systemID string) (*models.Connection, error) {
+	// Scan with filter since SystemId is not a key
+	result, err := s.client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        aws.String(ConnectionsTable),
+		FilterExpression: aws.String("SystemId = :sid"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":sid": &types.AttributeValueMemberS{Value: systemID},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(result.Items) == 0 {
+		return nil, nil
+	}
+
+	var conn models.Connection
+	if err := attributevalue.UnmarshalMap(result.Items[0], &conn); err != nil {
+		return nil, err
+	}
+	return &conn, nil
+}
+
 // --- Message/Conversation Management ---
 
 // getConversationID creates a consistent conversation ID from two user IDs
