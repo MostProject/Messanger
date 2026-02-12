@@ -36,6 +36,12 @@ Parameters:
     Type: Number
     Default: 8080
     Description: Port for health check endpoint
+  DomainName:
+    Type: String
+    Description: Custom domain name for WebSocket API (e.g., ws.example.com)
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 Hosted Zone ID for the domain
 
 Globals:
   Function:
@@ -72,6 +78,47 @@ Resources:
       ApiId: !Ref WebSocketApi
       StageName: !Ref Environment
       AutoDeploy: true
+
+  # ACM Certificate with automatic DNS validation via Route 53
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  # API Gateway Custom Domain
+  CustomDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref Certificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  # Map custom domain to WebSocket API (stage: prod, path: prod)
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn: WebSocketStage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DomainName: !Ref CustomDomainName
+      Stage: !Ref Environment
+      ApiMappingKey: prod
+
+  # Route 53 A-record alias pointing to API Gateway custom domain
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CustomDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt CustomDomainName.RegionalHostedZoneId
 
   # Connect Route
   ConnectRoute:
@@ -563,6 +610,10 @@ Outputs:
   ReportQueueUrl:
     Description: SQS Report Queue URL
     Value: !Ref ReportQueue
+
+  CustomDomainEndpoint:
+    Description: WebSocket API custom domain endpoint
+    Value: !Sub wss://${DomainName}/prod
 
   WorkerRepositoryUri:
     Description: ECR Repository URI for worker

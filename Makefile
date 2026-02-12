@@ -62,6 +62,8 @@ deploy: build check-keys
 			"VpcId=$(VPC_ID)" \
 			"AppName=$(APP_NAME)" \
 			"HealthPort=$(HEALTH_PORT)" \
+			"DomainName=$(DOMAIN_NAME)" \
+			"HostedZoneId=$(HOSTED_ZONE_ID)" \
 		--no-confirm-changeset \
 		--disable-rollback
 	@echo "Deployment complete"
