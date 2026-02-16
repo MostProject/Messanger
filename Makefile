@@ -63,9 +63,9 @@ deploy: build check-keys
 			"AppName=$(APP_NAME)" \
 			"HealthPort=$(HEALTH_PORT)" \
 			"DomainName=$(DOMAIN_NAME)" \
+			"CertificateArn=$(CERTIFICATE_ARN)" \
 			"HostedZoneId=$(HOSTED_ZONE_ID)" \
-		--no-confirm-changeset \
-		--disable-rollback
+		--no-confirm-changeset
 	@echo "Deployment complete"
 
 # Check required environment variables

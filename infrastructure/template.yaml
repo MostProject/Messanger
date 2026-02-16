@@ -39,6 +39,9 @@ Parameters:
   DomainName:
     Type: String
     Description: Custom domain name for WebSocket API (e.g., ws.example.com)
+  CertificateArn:
+    Type: String
+    Description: ACM Certificate ARN for the custom domain
   HostedZoneId:
     Type: AWS::Route53::HostedZone::Id
     Description: Route 53 Hosted Zone ID for the domain
@@ -79,23 +82,13 @@ Resources:
       StageName: !Ref Environment
       AutoDeploy: true
 
-  # ACM Certificate with automatic DNS validation via Route 53
-  Certificate:
-    Type: AWS::CertificateManager::Certificate
-    Properties:
-      DomainName: !Ref DomainName
-      ValidationMethod: DNS
-      DomainValidationOptions:
-        - DomainName: !Ref DomainName
-          HostedZoneId: !Ref HostedZoneId
-
   # API Gateway Custom Domain
   CustomDomainName:
     Type: AWS::ApiGatewayV2::DomainName
     Properties:
       DomainName: !Ref DomainName
       DomainNameConfigurations:
-        - CertificateArn: !Ref Certificate
+        - CertificateArn: !Ref CertificateArn
           EndpointType: REGIONAL
           SecurityPolicy: TLS_1_2
 
@@ -107,7 +100,6 @@ Resources:
       ApiId: !Ref WebSocketApi
       DomainName: !Ref CustomDomainName
       Stage: !Ref Environment
-      ApiMappingKey: prod
 
   # Route 53 A-record alias pointing to API Gateway custom domain
   DnsRecord:
@@ -613,7 +605,7 @@ Outputs:
 
   CustomDomainEndpoint:
     Description: WebSocket API custom domain endpoint
-    Value: !Sub wss://${DomainName}/prod
+    Value: !Sub wss://${DomainName}
 
   WorkerRepositoryUri:
     Description: ECR Repository URI for worker
