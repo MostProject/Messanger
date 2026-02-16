@@ -38,9 +38,11 @@ func (s *WebSocketService) SendToConnection(ctx context.Context, connectionID st
 		Data:         jsonData,
 	})
 	if err != nil {
-		// Check if connection is stale and clean up
-		log.Printf("Failed to send to connection %s: %v", connectionID, err)
-		// Don't return error for stale connections, just log it
+		log.Printf("Failed to send to connection %s (removing stale connection): %v", connectionID, err)
+		// Clean up stale connection from DynamoDB so it doesn't block reconnections
+		if delErr := s.store.DeleteConnection(ctx, connectionID); delErr != nil {
+			log.Printf("Failed to delete stale connection %s: %v", connectionID, delErr)
+		}
 		return nil
 	}
 

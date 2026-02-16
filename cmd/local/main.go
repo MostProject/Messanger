@@ -155,10 +155,17 @@ func (s *LocalServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	defer func() {
-		// Remove from connection store (so duplicate SystemId check doesn't find stale entries)
+		// Remove from in-memory connection store (so duplicate SystemId check doesn't find stale entries)
 		s.store.mu.Lock()
 		delete(s.store.connections, connID)
 		s.store.mu.Unlock()
+
+		// Remove from DynamoDB if enabled
+		if s.useDynamo && s.dynamo != nil {
+			if err := s.dynamo.DeleteConnection(context.Background(), connID); err != nil {
+				s.logger.Error(ctx, "Failed to delete connection from DynamoDB", err, nil)
+			}
+		}
 
 		// Remove WebSocket connection
 		s.wsConnsMu.Lock()
@@ -584,6 +591,8 @@ func (s *LocalServer) startPingLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			var staleConns []string
+
 			s.wsConnsMu.RLock()
 			for connID, conn := range s.wsConns {
 				err := conn.WriteJSON(map[string]interface{}{
@@ -592,13 +601,38 @@ func (s *LocalServer) startPingLoop(ctx context.Context) {
 					"PingId":      fmt.Sprintf("ping-%d", time.Now().UnixNano()),
 				})
 				if err != nil {
-					s.logger.Warn(ctx, "Failed to send ping", map[string]interface{}{
+					s.logger.Warn(ctx, "Failed to send ping, marking stale", map[string]interface{}{
 						"connection_id": connID,
 						"error":         err.Error(),
 					})
+					staleConns = append(staleConns, connID)
 				}
 			}
 			s.wsConnsMu.RUnlock()
+
+			// Clean up stale connections outside the read lock
+			for _, connID := range staleConns {
+				s.store.mu.Lock()
+				delete(s.store.connections, connID)
+				s.store.mu.Unlock()
+
+				if s.useDynamo && s.dynamo != nil {
+					if err := s.dynamo.DeleteConnection(ctx, connID); err != nil {
+						s.logger.Error(ctx, "Failed to delete stale connection from DynamoDB", err, nil)
+					}
+				}
+
+				s.wsConnsMu.Lock()
+				if ws, ok := s.wsConns[connID]; ok {
+					ws.Close()
+					delete(s.wsConns, connID)
+				}
+				s.wsConnsMu.Unlock()
+
+				s.logger.Info(ctx, "Cleaned up stale connection", map[string]interface{}{
+					"connection_id": connID,
+				})
+			}
 		}
 	}
 }
