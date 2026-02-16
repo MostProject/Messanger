@@ -100,6 +100,7 @@ Resources:
       ApiId: !Ref WebSocketApi
       DomainName: !Ref CustomDomainName
       Stage: !Ref Environment
+      ApiMappingKey: prod
 
   # Route 53 A-record alias pointing to API Gateway custom domain
   DnsRecord:
@@ -605,7 +606,7 @@ Outputs:
 
   CustomDomainEndpoint:
     Description: WebSocket API custom domain endpoint
-    Value: !Sub wss://${DomainName}
+    Value: !Sub wss://${DomainName}/prod
 
   WorkerRepositoryUri:
     Description: ECR Repository URI for worker
