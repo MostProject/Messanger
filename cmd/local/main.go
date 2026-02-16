@@ -155,11 +155,19 @@ func (s *LocalServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	defer func() {
+		// Remove from connection store (so duplicate SystemId check doesn't find stale entries)
+		s.store.mu.Lock()
+		delete(s.store.connections, connID)
+		s.store.mu.Unlock()
+
+		// Remove WebSocket connection
 		s.wsConnsMu.Lock()
 		delete(s.wsConns, connID)
 		s.wsConnsMu.Unlock()
 		conn.Close()
-		s.logger.Info(ctx, "WebSocket client disconnected", nil)
+		s.logger.Info(ctx, "WebSocket client disconnected", map[string]interface{}{
+			"connection_id": connID,
+		})
 	}()
 
 	for {
